@@ -149,10 +149,12 @@ sppr*.json=C:\Projects\ReportSPPR\examples
 
 ### Шаг 1. Установка основного скрипта
 
-[`Install.ps1`](Install.ps1) перемещает [`FileTransfer.ps1`](FileTransfer.ps1) в `C:\CHANGE`
-и копирует туда [`setcp.ini`](setcp.ini) (если он лежит рядом), создаёт рабочие папки
-`C:\CHANGE\IN` и `C:\CHANGE\OUT`, после чего автоматически запускает
-[`CreateShortcuts.ps1`](CreateShortcuts.ps1) (если он лежит рядом).
+[`Install.ps1`](Install.ps1) **копирует** (не перемещает!) [`FileTransfer.ps1`](FileTransfer.ps1)
+в `C:\CHANGE` и копирует туда [`setcp.ini`](setcp.ini) (если он лежит рядом), создаёт рабочие
+папки `C:\CHANGE\IN` и `C:\CHANGE\OUT`, автоматически запускает
+[`CreateShortcuts.ps1`](CreateShortcuts.ps1) (если он лежит рядом), после чего
+**останавливает работающие процессы СЛУШАТЕЛЯ и запускает его заново** с обновлённым
+кодом и настройками.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File Install.ps1

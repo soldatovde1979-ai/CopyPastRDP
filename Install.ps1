@@ -1,7 +1,9 @@
 ﻿# ===============================================================================
 #  Скрипт: Install.ps1
-#  Назначение: Перемещение FileTransfer.ps1 в C:\CHANGE, копирование setcp.ini,
-#              создание рабочих папок и запуск CreateShortcuts.ps1 (если он лежит рядом).
+#  Назначение: Копирование FileTransfer.ps1 в C:\CHANGE (исходник в репозитории
+#              остаётся), копирование setcp.ini, создание рабочих папок,
+#              запуск CreateShortcuts.ps1 (если он лежит рядом) и ПЕРЕЗАПУСК
+#              фонового СЛУШАТЕЛЯ (Watch), чтобы обновлённый код сразу заработал.
 #
 #  Запуск:     powershell -NoProfile -ExecutionPolicy Bypass -File Install.ps1
 # ===============================================================================
@@ -45,19 +47,20 @@ if ($HasError) {
     exit 1
 }
 
-# ===== 3. Перемещение FileTransfer.ps1 в C:\CHANGE =====
+# ===== 3. Копирование FileTransfer.ps1 в C:\CHANGE =====
+# Копируем, а не перемещаем: исходник должен остаться в папке проекта/git-репозитория.
 $targetScript = Join-Path $Destination "FileTransfer.ps1"
 $srcFull  = [System.IO.Path]::GetFullPath($sourceScript)
 $dstFull  = [System.IO.Path]::GetFullPath($targetScript)
 
 if ($srcFull -ieq $dstFull) {
-    Write-Step "FileTransfer.ps1 уже находится в $Destination - перенос не требуется." "Yellow"
+    Write-Step "FileTransfer.ps1 уже находится в $Destination - копирование не требуется." "Yellow"
 } else {
     try {
-        Move-Item -Path $sourceScript -Destination $targetScript -Force
-        Write-Step "FileTransfer.ps1 перемещён: $sourceScript -> $targetScript" "Green"
+        Copy-Item -Path $sourceScript -Destination $targetScript -Force
+        Write-Step "FileTransfer.ps1 скопирован: $sourceScript -> $targetScript" "Green"
     } catch {
-        Write-Step "ОШИБКА: не удалось переместить FileTransfer.ps1 - $($_.Exception.Message)" "Red"
+        Write-Step "ОШИБКА: не удалось скопировать FileTransfer.ps1 - $($_.Exception.Message)" "Red"
         pause
         exit 1
     }
@@ -87,6 +90,32 @@ if (Test-Path $shortcutScript -PathType Leaf) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $shortcutScript
 } else {
     Write-Step "ПРИМЕЧАНИЕ: CreateShortcuts.ps1 не найден рядом - ярлыки не создавались." "Yellow"
+}
+
+# ===== 5. Перезапуск фонового СЛУШАТЕЛЯ (Watch) =====
+# Уже работающий слушатель держит в памяти СТАРЫЙ код и старые настройки,
+# поэтому останавливаем все его процессы и запускаем обновлённую версию.
+$PowerShellExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+Write-Step "Проверяю работающие процессы СЛУШАТЕЛЯ..." "Cyan"
+$watchProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*FileTransfer.ps1*Watch*" })
+foreach ($proc in $watchProcesses) {
+    try {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        Write-Step "Остановлен старый СЛУШАТЕЛЬ (PID $($proc.ProcessId))" "Yellow"
+    } catch {
+        Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось остановить процесс PID $($proc.ProcessId)" "Yellow"
+    }
+}
+Start-Sleep -Milliseconds 500
+
+try {
+    $listenerProcess = Start-Process -FilePath $PowerShellExe `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$targetScript`" Watch" `
+        -WorkingDirectory $Destination -PassThru
+    Write-Step "СЛУШАТЕЛЬ запущен заново (PID $($listenerProcess.Id)) — приём файлов и синхронизация активны." "Green"
+} catch {
+    Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось запустить СЛУШАТЕЛЯ - $($_.Exception.Message)" "Yellow"
 }
 
 Write-Step "`nУстановка завершена!" "Cyan"
