@@ -96,10 +96,20 @@ $script:ClipRetryDelayMs       = [int](Get-IniValue    -Section "Settings" -Key 
 $script:RoutesEnabled          = Get-IniBool -Section "Settings" -Key "RoutesEnabled"          -Default $true
 $script:RoutesOverrideUnpackTo = Get-IniBool -Section "Settings" -Key "RoutesOverrideUnpackTo" -Default $true
 
+# Синхронизация папки между контурами и сохранение сеанса (работают в режиме Watch)
+$script:DiskSyncEnabled   = Get-IniBool -Section "Settings" -Key "DiskSyncEnabled"   -Default $false
+$script:SyncPollMs        = [int](Get-IniValue -Section "Settings" -Key "SyncPollMs"        -Default "1000")
+$script:SyncAckTimeoutSec = [int](Get-IniValue -Section "Settings" -Key "SyncAckTimeoutSec" -Default "60")
+$script:KeepAliveMinutes  = [int](Get-IniValue -Section "Settings" -Key "KeepAliveMinutes"  -Default "0")
+
 # Рабочие каталоги и журнал
 $IN_DIR   = Get-IniPath -Section "Paths" -Key "InDir"   -Default "C:\CHANGE\IN"
 $OUT_DIR  = Get-IniPath -Section "Paths" -Key "OutDir"  -Default "C:\CHANGE\OUT"
 $LOG_FILE = Get-IniPath -Section "Paths" -Key "LogFile" -Default "C:\CHANGE\FileTransfer.log"
+
+# Папка синхронизации между контурами (на обоих контурах путь должен совпадать)
+$script:SyncDir = Get-IniPath -Section "Paths" -Key "SyncDir" -Default "C:\CHANGE\disk"
+if ($script:SyncDir.Length -gt 3) { $script:SyncDir = $script:SyncDir.TrimEnd('\', '/') }
 
 # Маршрутизация приёма по маскам имён файлов (секция [Routes] файла setcp.ini)
 $script:Routes = @()
@@ -114,8 +124,16 @@ if ($script:Ini.ContainsKey("Routes")) {
 
 $script:HasError = $false
 
+# Файлы, уже отправленные/принятые в режиме синхронизации: ключ "relpath|длина|LastWriteTimeUtc"
+# -> момент обработки. Нужно для защиты от петель (принятый файл не отправляется обратно)
+# и от повторной отправки неизменённых файлов.
+$script:SyncHandled = @{}
+
 if (-not (Test-Path $IN_DIR))  { New-Item -ItemType Directory -Path $IN_DIR  -Force | Out-Null }
 if (-not (Test-Path $OUT_DIR)) { New-Item -ItemType Directory -Path $OUT_DIR -Force | Out-Null }
+if ($script:DiskSyncEnabled -and -not (Test-Path $script:SyncDir)) {
+    New-Item -ItemType Directory -Path $script:SyncDir -Force | Out-Null
+}
 
 # ===== ЛОГИРОВАНИЕ =====
 function Write-Log {
@@ -415,9 +433,27 @@ function Unpack-Files {
 
     # Вариант 2: Чанк (FILE_CHUNK_DATA)
     if ($data.Marker -eq "FILE_CHUNK_DATA") {
-        $safeName  = [System.IO.Path]::GetFileName($data.Name)
-        $dest = Resolve-Destination -FileName $safeName -TargetDir $TargetDir -NoRoutes:$NoRoutes
-        if ($dest.Mask) { Write-Log "  ROUTE: '$safeName' matches '$($dest.Mask)' -> $($dest.Dir)" "Cyan" }
+        # Дисковая синхронизация: если у пакета есть RelPath и режим включён,
+        # файл сохраняется по тому же относительному пути в SyncDir другого контура.
+        $syncRel = $null
+        if ($script:DiskSyncEnabled -and $data.PSObject.Properties['RelPath'] -and -not [string]::IsNullOrWhiteSpace([string]$data.RelPath)) {
+            $syncRel = ([string]$data.RelPath) -replace '\\', '/'
+            $syncRel = (($syncRel -split '/') | Where-Object { $_ -notin @('', '.', '..') }) -join '/'
+        }
+
+        $safeName = [System.IO.Path]::GetFileName($data.Name)
+        if ($syncRel) { $safeName = [System.IO.Path]::GetFileName($syncRel) }
+
+        if ($syncRel) {
+            $relDir = Split-Path -Parent $syncRel
+            $syncTarget = if ($relDir) { Join-Path $script:SyncDir $relDir } else { $script:SyncDir }
+            if (-not (Test-Path $syncTarget)) { New-Item -ItemType Directory -Path $syncTarget -Force | Out-Null }
+            $dest = [pscustomobject]@{ Dir = $syncTarget; Mask = $null }
+            Write-Log "  SYNC: '$safeName' -> $($dest.Dir)" "Cyan"
+        } else {
+            $dest = Resolve-Destination -FileName $safeName -TargetDir $TargetDir -NoRoutes:$NoRoutes
+            if ($dest.Mask) { Write-Log "  ROUTE: '$safeName' matches '$($dest.Mask)' -> $($dest.Dir)" "Cyan" }
+        }
         $partPath  = Join-Path $dest.Dir "$safeName.part"
         $finalPath = Join-Path $dest.Dir $safeName
 
@@ -439,7 +475,14 @@ function Unpack-Files {
         if ($data.ChunkIndex -eq $data.TotalChunks) {
             if (Test-Path $finalPath) { Remove-Item $finalPath -Force }
             Move-Item $partPath $finalPath -Force
-            Write-Log "SUCCESS: File '$safeName' completely assembled!" "Green"
+            if ($syncRel) {
+                # Помечаем принятый файл как обработанный, чтобы не отправить его обратно (петля)
+                $item = Get-Item $finalPath -ErrorAction SilentlyContinue
+                if ($item) { Add-SyncHandled -Key (Get-SyncKey -Item $item -RelPath $syncRel) }
+                Write-Log "SUCCESS: Sync file '$syncRel' completely assembled!" "Green"
+            } else {
+                Write-Log "SUCCESS: File '$safeName' completely assembled!" "Green"
+            }
             [System.Media.SystemSounds]::Asterisk.Play()
         }
         return $true
@@ -450,12 +493,205 @@ function Unpack-Files {
     return $false
 }
 
+# ===== СИНХРОНИЗАЦИЯ ПАПКИ МЕЖДУ КОНТУРАМИ (РЕЖИМ WATCH) =====
+
+function Get-RelPath {
+    # Относительный путь файла от SyncDir (с прямыми слэшами)
+    param([string]$FullName)
+    $base = $script:SyncDir.TrimEnd('\', '/')
+    $rel = $FullName.Substring($base.Length).TrimStart('\', '/')
+    return ($rel -replace '\\', '/')
+}
+
+function Get-SyncKey {
+    # Ключ обработки файла: путь + размер + время записи (изменённый файл — новый ключ)
+    param([System.IO.FileInfo]$Item, [string]$RelPath)
+    return ("{0}|{1}|{2}" -f ($RelPath.ToLowerInvariant() -replace '\\', '/'), $Item.Length, $Item.LastWriteTimeUtc.Ticks)
+}
+
+function Add-SyncHandled {
+    param([string]$Key)
+    if ($script:SyncHandled.Count -ge 1000) {
+        # Периодическая очистка устаревших записей (старше 1 часа)
+        $cutoff = (Get-Date).AddHours(-1)
+        $fresh = @{}
+        foreach ($k in $script:SyncHandled.Keys) {
+            if ($script:SyncHandled[$k] -gt $cutoff) { $fresh[$k] = $script:SyncHandled[$k] }
+        }
+        $script:SyncHandled = $fresh
+    }
+    $script:SyncHandled[$Key] = Get-Date
+}
+
+function Test-FileFree {
+    # True, если файл можно открыть монопольно (никто не пишет в него прямо сейчас)
+    param([string]$Path)
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'None')
+        $fs.Close()
+        $fs.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Initialize-SyncSnapshot {
+    # При старте Watch всё, что уже лежит в SyncDir, считается синхронизированным,
+    # чтобы после перезапуска слушателя не слать всё заново и не плодить петли.
+    if (-not $script:DiskSyncEnabled) { return }
+    if (-not (Test-Path $script:SyncDir)) { return }
+    $count = 0
+    Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        Add-SyncHandled -Key (Get-SyncKey -Item $_ -RelPath (Get-RelPath -FullName $_.FullName))
+        $count++
+    }
+    if ($count -gt 0) { Write-Log "SYNC: $count file(s) already in '$($script:SyncDir)' marked as synchronized." "DarkGray" }
+}
+
+function Wait-SyncAck {
+    # Ждёт очистки буфера приёмником. При таймауте забирает свой пакет обратно,
+    # чтобы Watch не завис навсегда (слушатель на другом конце может быть выключен).
+    param([string]$RelPath)
+    $deadline = (Get-Date).AddSeconds($script:SyncAckTimeoutSec)
+    while ($true) {
+        Start-Sleep -Milliseconds $script:PollIntervalMs
+        try {
+            if (-not [System.Windows.Forms.Clipboard]::ContainsText()) { return $true }
+        } catch {
+            return $false
+        }
+        if ((Get-Date) -gt $deadline) {
+            try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
+            Write-Log "SYNC: ACK timeout for '$RelPath' - packet pulled back. Is the listener running on the other side?" "Yellow"
+            return $false
+        }
+    }
+}
+
+function Send-SyncFile {
+    # Отправка файла из SyncDir ЧАНКАМИ (существующим механизмом FILE_CHUNK_DATA)
+    # на такой же относительный путь (RelPath) в другом контуре.
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$RelPath
+    )
+
+    $chunkSizeBytes = $ChunkSizeMB * 1MB
+    $totalChunks = [math]::Ceiling($File.Length / $chunkSizeBytes)
+    if ($totalChunks -eq 0) { $totalChunks = 1 }
+    $fileGuid = [guid]::NewGuid().ToString("N")
+
+    Write-Log "SYNC: Sending '$RelPath' ($([math]::Round($File.Length/1MB,2)) MB) in $totalChunks chunk(s)..." "Cyan"
+
+    $stream = [System.IO.File]::Open($File.FullName, 'Open', 'Read', 'ReadWrite')
+    try {
+        $buffer = New-Object byte[] $chunkSizeBytes
+        $chunkIndex = 1
+
+        while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0 -or ($File.Length -eq 0 -and $chunkIndex -eq 1)) {
+            $actualBytes = if ($bytesRead -eq $chunkSizeBytes) { $buffer } else {
+                $slice = New-Object byte[] $bytesRead
+                [Array]::Copy($buffer, $slice, $bytesRead)
+                $slice
+            }
+
+            $payload = @{
+                Marker      = "FILE_CHUNK_DATA"
+                FileId      = $fileGuid
+                Name        = $File.Name
+                RelPath     = $RelPath
+                ChunkIndex  = $chunkIndex
+                TotalChunks = $totalChunks
+                Content     = [Convert]::ToBase64String($actualBytes)
+                Origin      = $env:COMPUTERNAME
+            }
+
+            $json = $payload | ConvertTo-Json -Compress
+
+            $clipOk = $false
+            $attempts = $script:ClipRetryAttempts
+            while ($attempts -gt 0 -and -not $clipOk) {
+                try {
+                    [System.Windows.Forms.Clipboard]::SetText($json)
+                    $clipOk = $true
+                } catch {
+                    $attempts--
+                    Start-Sleep -Milliseconds $script:ClipRetryDelayMs
+                }
+            }
+
+            if (-not $clipOk) {
+                Write-Log "SYNC: FATAL: cannot write chunk $chunkIndex/$totalChunks of '$RelPath' to clipboard!" "Red"
+                $script:HasError = $true
+                return $false
+            }
+
+            Write-Log "SYNC:   chunk $chunkIndex/$totalChunks sent. Waiting for ACK..." "Gray"
+
+            if (-not (Wait-SyncAck -RelPath $RelPath)) { return $false }
+
+            $chunkIndex++
+            if ($File.Length -eq 0) { break }
+        }
+    } finally {
+        $stream.Close()
+        $stream.Dispose()
+    }
+
+    Write-Log "SYNC: '$RelPath' fully transferred!" "Green"
+    return $true
+}
+
+function Scan-SyncDir {
+    # Периодический просмотр SyncDir: новый свободный файл -> отправка чанками
+    # на такой же относительный путь в другом контуре.
+    if (-not (Test-Path $script:SyncDir)) { return }
+
+    $files = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue)
+    foreach ($file in $files) {
+        $rel = Get-RelPath -FullName $file.FullName
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $key = Get-SyncKey -Item $file -RelPath $rel
+        if ($script:SyncHandled.ContainsKey($key)) { continue }
+        if (-not (Test-FileFree -Path $file.FullName)) {
+            Write-Log "SYNC: '$rel' is locked (still being written) - skipped" "DarkGray"
+            continue
+        }
+        if (Send-SyncFile -File $file -RelPath $rel) {
+            Add-SyncHandled -Key $key
+        }
+    }
+}
+
+# ===== СОХРАНЕНИЕ RDP-СЕАНСА (РЕЖИМ WATCH) =====
+
+function Send-KeepAlive {
+    # Лёгкая эмуляция активности (сдвиг курсора на 1 px и обратно), чтобы
+    # RDP-сессия не закрылась по таймауту бездействия. Включайте на ВНУТРЕННЕМ контуре.
+    Add-Type -AssemblyName System.Windows.Forms
+    $pos = [System.Windows.Forms.Cursor]::Position
+    try {
+        [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($pos.X + 1), $pos.Y)
+        [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($pos.X, $pos.Y)
+        Write-Log "KeepAlive: activity emulated (RDP session kept alive)" "DarkGray"
+    } catch {
+        Write-Log "KeepAlive: cannot move cursor - $($_.Exception.Message)" "Yellow"
+    }
+}
+
 # ===== СЛУШАТЕЛЬ (WATCHER) =====
 function Watch-Clipboard {
     param([string]$TargetDir = $IN_DIR)
 
     Write-Log "Started WATCH mode. Listening..." "Magenta"
+    if ($script:DiskSyncEnabled) { Write-Log "SYNC: disk sync ENABLED, watching '$($script:SyncDir)'..." "Magenta" }
+    if ($script:KeepAliveMinutes -gt 0) { Write-Log "KeepAlive: enabled, every $($script:KeepAliveMinutes) min" "Magenta" }
     Add-Type -AssemblyName System.Windows.Forms
+
+    Initialize-SyncSnapshot
+    $lastSyncScan  = Get-Date
+    $lastKeepAlive = Get-Date
 
     while ($true) {
         Start-Sleep -Milliseconds $script:PollIntervalMs
@@ -479,6 +715,22 @@ function Watch-Clipboard {
                 }
             }
         } catch {}
+
+        # ===== Синхронизация папки между контурами =====
+        if ($script:DiskSyncEnabled -and (((Get-Date) - $lastSyncScan).TotalMilliseconds -ge $script:SyncPollMs)) {
+            $lastSyncScan = Get-Date
+            try {
+                Scan-SyncDir
+            } catch {
+                Write-Log "SYNC: scan error - $($_.Exception.Message)" "Yellow"
+            }
+        }
+
+        # ===== Сохранение RDP-сеанса (keep-alive) =====
+        if ($script:KeepAliveMinutes -gt 0 -and (((Get-Date) - $lastKeepAlive).TotalMinutes -ge $script:KeepAliveMinutes)) {
+            $lastKeepAlive = Get-Date
+            try { Send-KeepAlive } catch {}
+        }
     }
 }
 

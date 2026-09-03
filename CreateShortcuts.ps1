@@ -12,6 +12,10 @@
 #  Автозагрузка (shell:startup):
 #   СЛУШАТЕЛЬ         -> powershell -WindowStyle Hidden ... Watch  (фоновый приём)
 #
+#  Для синхронизации папок между контурами (DiskSyncEnabled=1 в setcp.ini)
+#  и для keep-alive RDP-сеанса (KeepAliveMinutes) слушатель должен быть запущен
+#  на ОБОИХ контурах — выполните этот скрипт на каждом из них.
+#
 #  Существующие ярлыки перезаписываются молча (без запросов подтверждения).
 #
 #  Запуск: powershell -NoProfile -ExecutionPolicy Bypass -File CreateShortcuts.ps1
