@@ -6,7 +6,7 @@
  Аргументы/Режимы:
  - Pack [Пути]: Упаковка файлов/папок и запись в буфер обмена.
  - PackAuto [Пути]: Упаковка и ожидание, пока приемник заберет данные.
- - Unpack: Распаковка из буфера обмена в C:\CHANGE\IN.
+ - Unpack: Распаковка из буфера обмена (маршрут по маске из setcp.ini или в IN-каталог).
  - UnpackTo [Путь]: Распаковка в каталог выделенного файла/папки.
  - Watch: Фоновый режим ожидания и автоматического приема данных.
 ===============================================================================
@@ -16,12 +16,101 @@ param(
     [Parameter(Position=0, ValueFromRemainingArguments=$true)]
     [string[]]$Targets,
     [int]$ChunkThresholdMB = 10,
-    [int]$ChunkSizeMB = 5
+    [int]$ChunkSizeMB = 5,
+    [string]$Config = ""
 )
 
-$IN_DIR   = "C:\CHANGE\IN"
-$OUT_DIR  = "C:\CHANGE\OUT"
-$LOG_FILE = "C:\CHANGE\FileTransfer.log"
+# ===== ЗАГРУЗКА НАСТРОЕК ИЗ setcp.ini =====
+# По умолчанию INI ищется рядом со скриптом (C:\CHANGE\setcp.ini).
+# Другой файл можно указать параметром: -Config "путь\к\файлу.ini"
+$script:ConfigPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot "setcp.ini" }
+
+function Get-IniContent {
+    param([string]$Path)
+    $ini = @{}
+    if (-not (Test-Path $Path -PathType Leaf)) { return $ini }
+
+    # Чтение в UTF-8 независимо от наличия BOM (для корректных русских путей)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $text  = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    } else {
+        [System.Text.Encoding]::UTF8.GetString($bytes)
+    }
+
+    $section = ""
+    foreach ($raw in ($text -split "`r?`n")) {
+        $line = $raw.Trim()
+        if ($line -eq "" -or $line.StartsWith(";") -or $line.StartsWith("#")) { continue }
+        if ($line -match '^\[(.+)\]$') {
+            $section = $matches[1].Trim()
+            if (-not $ini.ContainsKey($section)) { $ini[$section] = @{} }
+            continue
+        }
+        if ($section -ne "" -and $line -match '^([^=]+)=(.*)$') {
+            $ini[$section][$matches[1].Trim()] = $matches[2].Trim()
+        }
+    }
+    return $ini
+}
+
+$script:Ini = Get-IniContent -Path $script:ConfigPath
+
+function Get-IniValue {
+    param([string]$Section, [string]$Key, [string]$Default = "")
+    if ($script:Ini.ContainsKey($Section) -and $script:Ini[$Section].ContainsKey($Key)) {
+        return [string]$script:Ini[$Section][$Key]
+    }
+    return $Default
+}
+
+function Get-IniPath {
+    # Путь из INI; поддержка переменных окружения (%USERPROFILE% и т.п.)
+    param([string]$Section, [string]$Key, [string]$Default)
+    $v = Get-IniValue -Section $Section -Key $Key -Default $Default
+    if ([string]::IsNullOrWhiteSpace($v)) { $v = $Default }
+    return [Environment]::ExpandEnvironmentVariables($v)
+}
+
+function Get-IniBool {
+    param([string]$Section, [string]$Key, [bool]$Default)
+    $v = Get-IniValue -Section $Section -Key $Key -Default ""
+    if ($v -eq "") { return $Default }
+    return ($v -in @("1", "true", "yes", "on"))
+}
+
+# Приоритет чисел: аргумент командной строки -> INI -> значение по умолчанию
+if (-not $PSBoundParameters.ContainsKey('ChunkThresholdMB')) {
+    $ChunkThresholdMB = [int](Get-IniValue -Section "Settings" -Key "ChunkThresholdMB" -Default "10")
+}
+if (-not $PSBoundParameters.ContainsKey('ChunkSizeMB')) {
+    $ChunkSizeMB = [int](Get-IniValue -Section "Settings" -Key "ChunkSizeMB" -Default "5")
+}
+
+# Остальные настройки
+$script:WarningSizeMB          = [double](Get-IniValue -Section "Settings" -Key "WarningSizeMB"     -Default "15")
+$script:MaxLogLines            = [int](Get-IniValue    -Section "Settings" -Key "MaxLogLines"       -Default "500")
+$script:PollIntervalMs         = [int](Get-IniValue    -Section "Settings" -Key "PollIntervalMs"    -Default "400")
+$script:ClipRetryAttempts      = [int](Get-IniValue    -Section "Settings" -Key "ClipRetryAttempts" -Default "10")
+$script:ClipRetryDelayMs       = [int](Get-IniValue    -Section "Settings" -Key "ClipRetryDelayMs"  -Default "300")
+$script:RoutesEnabled          = Get-IniBool -Section "Settings" -Key "RoutesEnabled"          -Default $true
+$script:RoutesOverrideUnpackTo = Get-IniBool -Section "Settings" -Key "RoutesOverrideUnpackTo" -Default $true
+
+# Рабочие каталоги и журнал
+$IN_DIR   = Get-IniPath -Section "Paths" -Key "InDir"   -Default "C:\CHANGE\IN"
+$OUT_DIR  = Get-IniPath -Section "Paths" -Key "OutDir"  -Default "C:\CHANGE\OUT"
+$LOG_FILE = Get-IniPath -Section "Paths" -Key "LogFile" -Default "C:\CHANGE\FileTransfer.log"
+
+# Маршрутизация приёма по маскам имён файлов (секция [Routes] файла setcp.ini)
+$script:Routes = @()
+if ($script:Ini.ContainsKey("Routes")) {
+    foreach ($mask in $script:Ini["Routes"].Keys) {
+        $target = [Environment]::ExpandEnvironmentVariables([string]$script:Ini["Routes"][$mask])
+        if (-not [string]::IsNullOrWhiteSpace($target)) {
+            $script:Routes += [pscustomobject]@{ Mask = $mask; Target = $target }
+        }
+    }
+}
 
 $script:HasError = $false
 
@@ -41,8 +130,8 @@ function Rotate-Log {
     try {
         if (Test-Path $LOG_FILE) {
             $lines = Get-Content $LOG_FILE -Encoding UTF8
-            if ($lines.Count -gt 500) {
-                $lines | Select-Object -Last 500 | Set-Content $LOG_FILE -Encoding UTF8
+            if ($lines.Count -gt $script:MaxLogLines) {
+                $lines | Select-Object -Last $script:MaxLogLines | Set-Content $LOG_FILE -Encoding UTF8
             }
         }
     } catch {}
@@ -84,7 +173,7 @@ function Pack-Files {
     if ($totalSizeMB -le $ChunkThresholdMB) {
         Write-Log "Packing $($files.Count) files ($totalSizeMB MB)..." "Cyan"
 
-        if ($totalSizeMB -gt 15) {
+        if ($totalSizeMB -gt $script:WarningSizeMB) {
             Write-Log "WARNING: Size $totalSizeMB MB. May be slow or fail in RDP!" "Red"
         }
 
@@ -135,7 +224,7 @@ function Pack-Files {
             if ($AutoWait) {
                 Write-Log "Waiting for receiver (WAITING FILE) to pick up the data..." "Cyan"
                 while ($true) {
-                    Start-Sleep -Milliseconds 400
+                    Start-Sleep -Milliseconds $script:PollIntervalMs
                     try {
                         if (-not [System.Windows.Forms.Clipboard]::ContainsText()) {
                             Write-Log "SUCCESS: Receiver confirmed pick up!" "Green"
@@ -183,14 +272,14 @@ function Pack-Files {
                     $json = $payload | ConvertTo-Json -Compress
 
                     $clipOk = $false
-                    $attempts = 10
+                    $attempts = $script:ClipRetryAttempts
                     while ($attempts -gt 0 -and -not $clipOk) {
                         try {
                             [System.Windows.Forms.Clipboard]::SetText($json)
                             $clipOk = $true
                         } catch {
                             $attempts--
-                            Start-Sleep -Milliseconds 300
+                            Start-Sleep -Milliseconds $script:ClipRetryDelayMs
                         }
                     }
 
@@ -203,7 +292,7 @@ function Pack-Files {
                     Write-Log "   -> Chunk $chunkIndex/$totalChunks sent. Waiting for ACK..." "Gray"
 
                     while ($true) {
-                        Start-Sleep -Milliseconds 400
+                        Start-Sleep -Milliseconds $script:PollIntervalMs
                         try {
                             if (-not [System.Windows.Forms.Clipboard]::ContainsText()) { break }
                         } catch {}
@@ -224,11 +313,40 @@ function Pack-Files {
     }
 }
 
+# ===== МАРШРУТИЗАЦИЯ ПРИЁМА ПО МАСКАМ =====
+function Resolve-Destination {
+    # Возвращает каталог назначения для файла: маршрут по маске из [Routes]
+    # либо TargetDir. Каталог назначения создаётся автоматически.
+    param([string]$FileName, [string]$TargetDir, [switch]$NoRoutes)
+
+    $result = [pscustomobject]@{ Dir = $TargetDir; Mask = $null }
+    if ($script:RoutesEnabled -and -not $NoRoutes) {
+        foreach ($route in $script:Routes) {
+            if ($FileName -like $route.Mask) {
+                $result.Dir  = $route.Target
+                $result.Mask = $route.Mask
+                break
+            }
+        }
+    }
+    if (-not (Test-Path $result.Dir)) {
+        try {
+            New-Item -ItemType Directory -Path $result.Dir -Force | Out-Null
+        } catch {
+            Write-Log "WARNING: Cannot create directory '$($result.Dir)' - using '$TargetDir'" "Yellow"
+            $result.Dir  = $TargetDir
+            $result.Mask = $null
+        }
+    }
+    return $result
+}
+
 # ===== РАСПАКОВКА И СБОРКА =====
 function Unpack-Files {
     param(
         [string]$TargetDir = $IN_DIR,
-        [string]$RawData = $null
+        [string]$RawData = $null,
+        [switch]$NoRoutes
     )
 
     $clipData = $RawData
@@ -273,7 +391,10 @@ function Unpack-Files {
                     continue
                 }
 
-                $outPath = Join-Path $TargetDir $safeName
+                $dest = Resolve-Destination -FileName $safeName -TargetDir $TargetDir -NoRoutes:$NoRoutes
+                if ($dest.Mask) { Write-Log "  ROUTE: '$safeName' matches '$($dest.Mask)' -> $($dest.Dir)" "Cyan" }
+
+                $outPath = Join-Path $dest.Dir $safeName
 
                 if (Test-Path $outPath) { Write-Log "  OVERWRITE: $safeName" "Yellow" }
 
@@ -295,8 +416,10 @@ function Unpack-Files {
     # Вариант 2: Чанк (FILE_CHUNK_DATA)
     if ($data.Marker -eq "FILE_CHUNK_DATA") {
         $safeName  = [System.IO.Path]::GetFileName($data.Name)
-        $partPath  = Join-Path $TargetDir "$safeName.part"
-        $finalPath = Join-Path $TargetDir $safeName
+        $dest = Resolve-Destination -FileName $safeName -TargetDir $TargetDir -NoRoutes:$NoRoutes
+        if ($dest.Mask) { Write-Log "  ROUTE: '$safeName' matches '$($dest.Mask)' -> $($dest.Dir)" "Cyan" }
+        $partPath  = Join-Path $dest.Dir "$safeName.part"
+        $finalPath = Join-Path $dest.Dir $safeName
 
         if ($data.ChunkIndex -eq 1 -and (Test-Path $partPath)) {
             Remove-Item $partPath -Force
@@ -335,7 +458,7 @@ function Watch-Clipboard {
     Add-Type -AssemblyName System.Windows.Forms
 
     while ($true) {
-        Start-Sleep -Milliseconds 400
+        Start-Sleep -Milliseconds $script:PollIntervalMs
         try {
             if ([System.Windows.Forms.Clipboard]::ContainsText()) {
                 $text = [System.Windows.Forms.Clipboard]::GetText()
@@ -394,7 +517,7 @@ elseif ($Action -eq "UnpackTo") {
         } else {
             $selectedPath
         }
-        [void](Unpack-Files -TargetDir $destination)
+        [void](Unpack-Files -TargetDir $destination -NoRoutes:(-not $script:RoutesOverrideUnpackTo))
     } else {
         Write-Log "ERROR: No target path given for UnpackTo!" "Red"
         $script:HasError = $true

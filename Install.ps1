@@ -1,7 +1,7 @@
 ﻿# ===============================================================================
 #  Скрипт: Install.ps1
-#  Назначение: Перемещение FileTransfer.ps1 в C:\CHANGE, создание рабочих папок
-#              и запуск CreateShortcuts.ps1 (если он лежит рядом).
+#  Назначение: Перемещение FileTransfer.ps1 в C:\CHANGE, копирование setcp.ini,
+#              создание рабочих папок и запуск CreateShortcuts.ps1 (если он лежит рядом).
 #
 #  Запуск:     powershell -NoProfile -ExecutionPolicy Bypass -File Install.ps1
 # ===============================================================================
@@ -60,6 +60,23 @@ if ($srcFull -ieq $dstFull) {
         Write-Step "ОШИБКА: не удалось переместить FileTransfer.ps1 - $($_.Exception.Message)" "Red"
         pause
         exit 1
+    }
+}
+
+# ===== 3.1 Копирование настроечного файла setcp.ini =====
+$iniSource = Join-Path $PSScriptRoot "setcp.ini"
+$iniTarget = Join-Path $Destination "setcp.ini"
+
+if (-not (Test-Path $iniSource -PathType Leaf)) {
+    Write-Step "ПРИМЕЧАНИЕ: setcp.ini не найден рядом - будут использованы настройки по умолчанию." "Yellow"
+} elseif ([System.IO.Path]::GetFullPath($iniSource) -ieq [System.IO.Path]::GetFullPath($iniTarget)) {
+    Write-Step "setcp.ini уже находится в $Destination - копирование не требуется." "Yellow"
+} else {
+    try {
+        Copy-Item -Path $iniSource -Destination $iniTarget -Force
+        Write-Step "setcp.ini скопирован: $iniSource -> $iniTarget" "Green"
+    } catch {
+        Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось скопировать setcp.ini - $($_.Exception.Message)" "Yellow"
     }
 }
 

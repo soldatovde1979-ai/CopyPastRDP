@@ -1,12 +1,18 @@
 ﻿# ===============================================================================
 #  Скрипт: CreateShortcuts.ps1
 #  Назначение: Создание ярлыков в shell:sendto (меню "Отправить") для передачи
-#              файлов через FileTransfer.ps1.
+#              файлов через FileTransfer.ps1, а также ярлыка "СЛУШАТЕЛЬ"
+#              в Автозагрузке (shell:startup) для фонового приёма Watch.
 #
-#  Ярлыки:
+#  Ярлыки (shell:sendto):
 #   SEND FILE         -> powershell ... FileTransfer.ps1 Pack      (быстрая отправка)
 #   RECEIVE FILE      -> powershell ... FileTransfer.ps1 UnpackTo  (приём в папку)
 #   SEND FILE (auto)  -> powershell ... FileTransfer.ps1 PackAuto  (отправка с ACK)
+#
+#  Автозагрузка (shell:startup):
+#   СЛУШАТЕЛЬ         -> powershell -WindowStyle Hidden ... Watch  (фоновый приём)
+#
+#  Существующие ярлыки перезаписываются молча (без запросов подтверждения).
 #
 #  Запуск: powershell -NoProfile -ExecutionPolicy Bypass -File CreateShortcuts.ps1
 # ===============================================================================
@@ -30,6 +36,21 @@ if (-not (Test-Path $ScriptPath)) {
 
 # ===== 1. Очистка старых ярлыков FileTransfer из SendTo =====
 Get-ChildItem -Path $SendTo -Filter "*.lnk" | ForEach-Object {
+    $lnkPath = $_.FullName
+    try {
+        $sh     = New-Object -ComObject WScript.Shell
+        $target = $sh.CreateShortcut($lnkPath)
+        if ($target.Arguments -like "*FileTransfer.ps1*") {
+            Remove-Item $lnkPath -Force
+            Write-Host "Удалён старый ярлык: $($_.Name)" -ForegroundColor DarkGray
+        }
+    } catch {}
+}
+
+# ===== 1.1 Очистка старых ярлыков FileTransfer из Автозагрузки =====
+$Startup = [Environment]::GetFolderPath('Startup')
+if (-not (Test-Path $Startup)) { New-Item -ItemType Directory -Path $Startup -Force | Out-Null }
+Get-ChildItem -Path $Startup -Filter "*.lnk" | ForEach-Object {
     $lnkPath = $_.FullName
     try {
         $sh     = New-Object -ComObject WScript.Shell
@@ -67,5 +88,21 @@ foreach ($name in $shortcuts.Keys) {
     Write-Host "Создан ярлык: $name -> FileTransfer.ps1 $mode" -ForegroundColor Green
 }
 
+# ===== 3. Ярлык «СЛУШАТЕЛЬ» в Автозагрузку (фоновый приём Watch) =====
+$listenerPath = Join-Path $Startup "СЛУШАТЕЛЬ.lnk"
+$listenerVerb = if (Test-Path $listenerPath) { "Перезаписан ярлык" } else { "Создан ярлык" }
+
+$lnk = $shell.CreateShortcut($listenerPath)
+$lnk.TargetPath       = $PowerShell
+$lnk.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" Watch"
+$lnk.WorkingDirectory = "C:\CHANGE"
+$lnk.WindowStyle      = 7
+$lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,45"
+$lnk.Description      = "FileTransfer: СЛУШАТЕЛЬ (фоновый приём, Watch)"
+$lnk.Save()
+
+Write-Host "$listenerVerb : СЛУШАТЕЛЬ -> FileTransfer.ps1 Watch (Автозагрузка)" -ForegroundColor Green
+
 Write-Host "`nГотово! Ярлыки находятся в: $SendTo" -ForegroundColor Cyan
+Write-Host "Слушатель в Автозагрузке: $listenerPath" -ForegroundColor Cyan
 pause

@@ -19,7 +19,8 @@
 | Файл | Назначение |
 |---|---|
 | [`FileTransfer.ps1`](FileTransfer.ps1) | Основной скрипт: упаковка, отправка, приём, фоновый слушатель |
-| [`Install.ps1`](Install.ps1) | Установка: перенос FileTransfer.ps1 в `C:\CHANGE` и создание папок |
+| [`setcp.ini`](setcp.ini) | Настроечный файл: параметры, пути, маршрутизация приёма по маскам |
+| [`Install.ps1`](Install.ps1) | Установка: перенос FileTransfer.ps1 и setcp.ini в `C:\CHANGE`, создание папок |
 | [`CreateShortcuts.ps1`](CreateShortcuts.ps1) | Создание ярлыков SEND FILE / RECEIVE FILE / SEND FILE (auto) в shell:sendto |
 | [`Hotkeys.ahk`](Hotkeys.ahk) | AutoHotkey v2: глобальные хоткеи, исправление раскладки, быстрая вставка ссылки |
 | [`SPEC.md`](SPEC.md) | Спецификация протокола данных и формата журнала (data log) |
@@ -70,13 +71,57 @@
 
 Папки `C:\CHANGE\IN` и `C:\CHANGE\OUT` создаются автоматически. Журнал работы пишется в `C:\CHANGE\FileTransfer.log` (формат описан в [`SPEC.md`](SPEC.md)).
 
-## 5. Установка и ярлыки (shell:sendto)
+## 5. Настройка ([`setcp.ini`](setcp.ini))
+
+Все параметры скрипта вынесены в настроечный файл [`setcp.ini`](setcp.ini), который лежит
+рядом с FileTransfer.ps1 (обычно `C:\CHANGE\setcp.ini`). При его отсутствии используются
+значения по умолчанию. Другой файл можно указать аргументом `-Config "путь\к\файлу.ini"`.
+
+Структура файла:
+
+```ini
+[Settings]
+ChunkThresholdMB=10        ; порог включения чанкового режима, МБ
+ChunkSizeMB=5              ; размер одного чанка, МБ
+WarningSizeMB=15           ; предупреждение при большом пакете, МБ
+MaxLogLines=500            ; максимум строк в журнале
+PollIntervalMs=400         ; интервал опроса буфера, мс
+ClipRetryAttempts=10       ; попыток записи чанка в буфер
+ClipRetryDelayMs=300       ; пауза между попытками, мс
+RoutesEnabled=1            ; маршрутизация по маскам
+RoutesOverrideUnpackTo=1   ; маски приоритетнее папки UnpackTo
+
+[Paths]
+InDir=C:\CHANGE\IN
+OutDir=C:\CHANGE\OUT
+LogFile=C:\CHANGE\FileTransfer.log
+
+[Routes]
+; Маска имени файла = каталог назначения
+sppr*.json=C:\Projects\ReportSPPR\examples
+```
+
+### Маршрутизация приёма по маскам
+
+В секции `[Routes]` ключ — **маска имени файла** (`*` и `?`), значение — **каталог**,
+куда сохранить подошедший файл. Например, файл `sppr-2026-09-02.json` при приёме
+попадёт не в `C:\CHANGE\IN`, а в `C:\Projects\ReportSPPR\examples` (каталог создаётся
+автоматически). Маски сверяются по порядку — первое совпадение побеждает. В путях
+поддерживаются переменные окружения (`%USERPROFILE%` и т.п.).
+
+Маршрутизация работает во всех режимах приёма: `Watch`, `Unpack`, `UnpackTo`.
+Флаг `RoutesOverrideUnpackTo=0` отключает её для ручного режима `UnpackTo`
+(приоритет получает выбранная пользователем папка), а `RoutesEnabled=0` — полностью.
+В журнале маршрутизированный файл отмечается строкой `ROUTE:`.
+
+## 6. Установка и ярлыки (shell:sendto)
 
 ### Шаг 1. Установка основного скрипта
 
-[`Install.ps1`](Install.ps1) перемещает [`FileTransfer.ps1`](FileTransfer.ps1) в `C:\CHANGE`,
-создаёт рабочие папки `C:\CHANGE\IN` и `C:\CHANGE\OUT`, после чего автоматически
-запускает [`CreateShortcuts.ps1`](CreateShortcuts.ps1) (если он лежит рядом).
+[`Install.ps1`](Install.ps1) перемещает [`FileTransfer.ps1`](FileTransfer.ps1) в `C:\CHANGE`
+и копирует туда [`setcp.ini`](setcp.ini) (если он лежит рядом), создаёт рабочие папки
+`C:\CHANGE\IN` и `C:\CHANGE\OUT`, после чего автоматически запускает
+[`CreateShortcuts.ps1`](CreateShortcuts.ps1) (если он лежит рядом).
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File Install.ps1
@@ -98,13 +143,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File CreateShortcuts.ps1
 | SEND FILE (auto) | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\CHANGE\FileTransfer.ps1" PackAuto` |
 | SEND FILE (no chank) | *(заготовка в скрипте — режим ещё не реализован в FileTransfer.ps1)* |
 
-При повторном запуске старые ярлыки FileTransfer удаляются и создаются заново.
+Помимо меню «Отправить» создаётся ярлык **СЛУШАТЕЛЬ** в Автозагрузке (`shell:startup`) —
+фоновый приём `Watch` в скрытом окне:
 
-> Фоновый слушатель (`Watch`) на приёмнике: создайте ярлык с аргументом
-> `-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\CHANGE\FileTransfer.ps1" Watch`
-> и поместите его в Автозагрузку (`shell:startup`).
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\CHANGE\FileTransfer.ps1" Watch`
 
-## 6. Горячие клавиши ([`Hotkeys.ahk`](Hotkeys.ahk))
+При повторном запуске существующие ярлыки перезаписываются молча, а старые
+ярлыки FileTransfer с другими именами удаляются.
+
+## 7. Горячие клавиши ([`Hotkeys.ahk`](Hotkeys.ahk))
 
 Скрипт AutoHotkey v2.0. При запуске показывает окно с подсказкой.
 
@@ -128,7 +175,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File CreateShortcuts.ps1
 > (функции [`DetectDirection()`](Hotkeys.ahk:38) и [`SwitchLayout()`](Hotkeys.ahk:52)),
 > после исправления переключается системная раскладка.
 
-## 7. Документация протокола
+## 8. Документация протокола
 
 Форматы JSON-пакетов, протокол ACK, механизм «свой-чужой» и формат журнала
 `C:\CHANGE\FileTransfer.log` подробно описаны в [`SPEC.md`](SPEC.md).
