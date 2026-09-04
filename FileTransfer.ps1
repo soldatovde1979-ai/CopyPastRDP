@@ -484,7 +484,9 @@ function Unpack-Files {
             # в маске (вместо SyncDir).
             $syncTarget = $null
             $routeMask  = $null
-            if ($script:RoutesEnabled) {
+            # Маркер удаления .del маршрутизации не подлежит: он всегда
+            # сохраняется в КОРЕНЬ SyncDir, иначе очистка на этом контуре не сработает.
+            if ($script:RoutesEnabled -and $syncRel -ne '.del') {
                 foreach ($route in $script:Routes) {
                     if ($safeName -like $route.Mask) {
                         $syncTarget = $route.Target
@@ -747,9 +749,47 @@ function Scan-SyncDir {
         return
     }
 
-    # Служебные файлы не отправляются: сам журнал change.log и незавершённые сборки .part
+    # Маркер удаления: файл .del в КОРНЕ SyncDir -> очистка ВСЕЙ папки на обоих контурах.
+    # Маркер синхронизируется как обычный файл: сначала он отправляется на другой
+    # контур (существующим чанковым механизмом), и только после подтверждения
+    # этот контур очищает свою папку. Приёмник, получив маркер, увидит его при
+    # следующем скане у себя и очистит свою папку. Очистка откладывается до
+    # успешной отправки: если слушатель другого контура выключен, маркер будет
+    # отправлен при следующем скане, и папки останутся нетронутыми.
+    $delMarkerPath = Join-Path $script:SyncDir ".del"
+    if (Test-Path -LiteralPath $delMarkerPath -PathType Leaf) {
+        $markerItem = Get-Item -LiteralPath $delMarkerPath -Force -ErrorAction SilentlyContinue
+        if ($markerItem) {
+            $markerKey = Get-SyncKey -Item $markerItem -RelPath ".del"
+            $markerHandled = $script:ChangeLog.ContainsKey($markerKey) -and $script:ChangeLog[$markerKey] -in @('SENT', 'RECEIVED')
+            if (-not $markerHandled) {
+                # Маркер ещё не ушёл на другой контур - отправляем его как обычный файл.
+                if (Test-FileFree -Path $delMarkerPath) {
+                    if (Send-SyncFile -File $markerItem -RelPath ".del") {
+                        Add-ChangeEntry -Type "SENT" -RelPath ".del" -Item $markerItem
+                        $markerHandled = $true
+                    } else {
+                        Write-Log "DEL-MARKER: '.del' not sent yet (remote listener is down?) - will retry on next scan" "Yellow"
+                    }
+                } else {
+                    Write-Log "DEL-MARKER: '.del' is locked (still being written) - will retry" "DarkGray"
+                }
+            }
+            if ($markerHandled) {
+                Write-Log "DEL-MARKER: '.del' found in '$($script:SyncDir)' - clearing the whole folder" "Cyan"
+                $removed = Clear-SyncDirLocal
+                Write-Log "DEL-MARKER: '$($script:SyncDir)' cleared ($removed item(s) removed)" "Cyan"
+                return
+            }
+            # Маркер ещё не отправлен: продолжаем обычный скан (маркер из
+            # перечисления исключён) - попытка повторится при следующем скане.
+        }
+    }
+
+    # Служебные файлы не отправляются: сам журнал change.log, маркер удаления .del
+    # (обрабатывается отдельно выше) и незавершённые сборки .part
     $files       = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ine 'change.log' -and $_.Extension -ne '.part' })
+        Where-Object { $_.Name -ine 'change.log' -and $_.Name -ine '.del' -and $_.Extension -ne '.part' })
     $newCount    = 0
     $handledCount = 0
     $lockedCount = 0
@@ -1237,6 +1277,38 @@ function Invoke-ClearDisk {
     }
 }
 
+function Invoke-MarkDelete {
+    # FileTransfer.ps1 MarkDelete - положить маркер-файл .del в корень SyncDir.
+    # Слушатель (Watch) с DiskSyncEnabled=1 увидит маркер при сканировании,
+    # отправит его на другой контур обычной синхронизацией и очистит свою папку;
+    # слушатель другого контура, приняв маркер, очистит папку у себя.
+    # Работает и при выключенном слушателе: маркер дождётся его запуска.
+    if (-not $script:DiskSyncEnabled) {
+        Write-Log "DEL-MARKER: disk sync is DISABLED (DiskSyncEnabled=0) - the marker will not work" "Yellow"
+        return
+    }
+    if (-not (Test-Path $script:SyncDir)) {
+        try { New-Item -ItemType Directory -Path $script:SyncDir -Force | Out-Null }
+        catch {
+            Write-Log "DEL-MARKER: cannot create SyncDir '$($script:SyncDir)' - $($_.Exception.Message)" "Red"
+            $script:HasError = $true
+            return
+        }
+    }
+    $markerPath = Join-Path $script:SyncDir ".del"
+    try {
+        if (-not (Test-Path -LiteralPath $markerPath)) {
+            [System.IO.File]::WriteAllText($markerPath, "")
+            Write-Log "DEL-MARKER: '.del' placed into '$($script:SyncDir)' - both sides will clear their SyncDir when the listener sees it" "Green"
+        } else {
+            Write-Log "DEL-MARKER: '.del' already exists in '$($script:SyncDir)' - waiting for the listener" "Cyan"
+        }
+    } catch {
+        Write-Log "DEL-MARKER: cannot create '.del' - $($_.Exception.Message)" "Red"
+        $script:HasError = $true
+    }
+}
+
 # ===== РУЧНОЙ ПРИЁМ (UnpackTo): «СНАЧАЛА SEND, ПОТОМ RECEIVE» =====
 function Invoke-ManualReceive {
     # Порядок работы «как раньше»: сначала Send на источнике, затем Receive File здесь.
@@ -1317,7 +1389,7 @@ function Invoke-ManualReceive {
 $Action = $null
 $Paths  = @()
 foreach ($arg in $Targets) {
-    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend", "ClearDisk")) {
+    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend", "ClearDisk", "MarkDelete")) {
         $Action = $arg
     } else {
         $Paths += $arg
@@ -1371,6 +1443,9 @@ elseif ($Action -eq "Resend") {
 }
 elseif ($Action -eq "ClearDisk") {
     Invoke-ClearDisk
+}
+elseif ($Action -eq "MarkDelete") {
+    Invoke-MarkDelete
 }
 elseif ($Paths.Count -gt 0) {
     Pack-Files -Paths $Paths
