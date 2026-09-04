@@ -104,6 +104,10 @@ $script:KeepAliveMinutes  = [int](Get-IniValue -Section "Settings" -Key "KeepAli
 # Самообновление через папку синхронизации: принятые в SyncDir файлы
 # FileTransfer.ps1 / setcp.ini копируются в каталог скрипта и слушатель перезапускается.
 $script:AutoUpdate = Get-IniBool -Section "Settings" -Key "AutoUpdate" -Default $true
+# Диагностика слушателя: периодический heartbeat в журнал (0 — выключен)
+# и подробный trace-режим с причинами каждого действия (0/1).
+$script:WatchHeartbeatSec = [int](Get-IniValue -Section "Settings" -Key "WatchHeartbeatSec" -Default "60")
+$script:WatchTrace        = Get-IniBool -Section "Settings" -Key "WatchTrace"        -Default $false
 
 # Рабочие каталоги и журнал
 $IN_DIR   = Get-IniPath -Section "Paths" -Key "InDir"   -Default "C:\CHANGE\IN"
@@ -130,6 +134,9 @@ $script:HasError = $false
 # Флаг самообновления: устанавливается приёмником после применения FileTransfer.ps1/setcp.ini,
 # по нему Watch перезапускает себя с новым кодом.
 $script:RestartNeeded = $false
+
+# Занятые файлы SyncDir (для логирования только перехода состояния, без спама каждую секунду)
+$script:LastLocked = @{}
 
 # Файлы, уже отправленные/принятые в режиме синхронизации: ключ "relpath|длина|LastWriteTimeUtc"
 # -> момент обработки. Нужно для защиты от петель (принятый файл не отправляется обратно)
@@ -666,21 +673,47 @@ function Send-SyncFile {
 function Scan-SyncDir {
     # Периодический просмотр SyncDir: новый свободный файл -> отправка чанками
     # на такой же относительный путь в другом контуре.
-    if (-not (Test-Path $script:SyncDir)) { return }
+    if (-not (Test-Path $script:SyncDir)) {
+        if ($script:WatchTrace) { Write-Log "TRACE: SyncDir '$($script:SyncDir)' not found" "DarkGray" }
+        return
+    }
 
-    $files = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue)
+    $files       = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue)
+    $newCount    = 0
+    $handledCount = 0
+    $lockedCount = 0
+    $sentCount   = 0
+    $failedCount = 0
     foreach ($file in $files) {
         $rel = Get-RelPath -FullName $file.FullName
         if ([string]::IsNullOrWhiteSpace($rel)) { continue }
         $key = Get-SyncKey -Item $file -RelPath $rel
-        if ($script:SyncHandled.ContainsKey($key)) { continue }
-        if (-not (Test-FileFree -Path $file.FullName)) {
-            Write-Log "SYNC: '$rel' is locked (still being written) - skipped" "DarkGray"
+        if ($script:SyncHandled.ContainsKey($key)) {
+            $handledCount++
+            if ($script:WatchTrace) { Write-Log "TRACE: skip '$rel' - already processed" "DarkGray" }
             continue
         }
+        $newCount++
+        if (-not (Test-FileFree -Path $file.FullName)) {
+            $lockedCount++
+            # Занятый файл логируем только при переходе состояния, чтобы не спамить каждую секунду
+            if (-not $script:LastLocked.ContainsKey($key)) {
+                Write-Log "SYNC: '$rel' is locked (still being written) - will retry when free" "DarkGray"
+                $script:LastLocked[$key] = $true
+            }
+            continue
+        }
+        $script:LastLocked.Remove($key)
         if (Send-SyncFile -File $file -RelPath $rel) {
             Add-SyncHandled -Key $key
+            $sentCount++
+        } else {
+            $failedCount++
+            Write-Log "SYNC: '$rel' NOT sent - will retry on next scan" "Yellow"
         }
+    }
+    if ($script:WatchTrace -and $files.Count -gt 0) {
+        Write-Log "TRACE: scan result: total=$($files.Count), new=$newCount, already-processed=$handledCount, locked=$lockedCount, sent=$sentCount, failed=$failedCount" "DarkGray"
     }
 }
 
@@ -717,49 +750,86 @@ function Restart-Listener {
     exit 0
 }
 
+# ===== ЗАЩИТА ОТ ПОВТОРНОГО ЗАПУСКА СЛУШАТЕЛЯ =====
+
+function Stop-OldListeners {
+    # При старте Watch завершаем другие работающие экземпляры слушателя (кроме себя),
+    # чтобы несколько процессов не конкурировали за буфер обмена.
+    $old = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*FileTransfer.ps1*Watch*" })
+    foreach ($proc in $old) {
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+            Write-Log "Watch: stopped previous listener instance (PID $($proc.ProcessId))" "Yellow"
+        } catch {
+            Write-Log "Watch: WARNING: cannot stop previous listener PID $($proc.ProcessId) - $($_.Exception.Message)" "Yellow"
+        }
+    }
+    if ($old.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+}
+
 # ===== СЛУШАТЕЛЬ (WATCHER) =====
 function Watch-Clipboard {
     param([string]$TargetDir = $IN_DIR)
 
+    # Защита от двойного запуска: завершаем старый экземпляр слушателя, если он есть.
+    Stop-OldListeners
+
     Write-Log "Started WATCH mode. Listening..." "Magenta"
     if ($script:DiskSyncEnabled) { Write-Log "SYNC: disk sync ENABLED, watching '$($script:SyncDir)'..." "Magenta" }
     if ($script:KeepAliveMinutes -gt 0) { Write-Log "KeepAlive: enabled, every $($script:KeepAliveMinutes) min" "Magenta" }
+    if ($script:WatchTrace) { Write-Log "TRACE: verbose logging enabled (each poll cycle)" "DarkGray" }
+    if ($script:WatchHeartbeatSec -gt 0) { Write-Log "Heartbeat: every $($script:WatchHeartbeatSec) sec" "DarkGray" }
     Add-Type -AssemblyName System.Windows.Forms
 
     Initialize-SyncSnapshot
     $lastSyncScan  = Get-Date
     $lastKeepAlive = Get-Date
+    $lastHeartbeat = Get-Date
 
     while ($true) {
         Start-Sleep -Milliseconds $script:PollIntervalMs
+
+        # ===== Приём из буфера обмена =====
+        $clipState = "empty"
+        $skipScan  = $false
         try {
             if ([System.Windows.Forms.Clipboard]::ContainsText()) {
                 $text = [System.Windows.Forms.Clipboard]::GetText()
-                if (-not [string]::IsNullOrWhiteSpace($text) -and ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA)"')) {
+                if ([string]::IsNullOrWhiteSpace($text)) {
+                    $clipState = "empty"
+                } elseif ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA)"') {
 
                     # Свой-чужой: пакет с Origin = имя этого же ПК положен локально этим же скриптом.
                     # Он предназначен для Watch на ДРУГОМ конце RDP - не трогаем буфер, ждём его.
                     if ($text -match '"Origin"\s*:\s*"([^"]+)"' -and $matches[1] -eq $env:COMPUTERNAME) {
-                        continue
+                        $clipState = "own-packet"
+                        $skipScan  = $true
+                    } else {
+                        $clipState = "foreign-packet"
+                        $script:HasError = $false
+                        $script:RestartNeeded = $false
+                        $processed = Unpack-Files -TargetDir $TargetDir -RawData $text
+
+                        if ($processed) {
+                            [System.Windows.Forms.Clipboard]::Clear()
+                        }
+
+                        # Самообновление: принятый FileTransfer.ps1/setcp.ini применён - перезапускаемся
+                        if ($script:RestartNeeded) { Restart-Listener }
                     }
-
-                    $script:HasError = $false
-                    $script:RestartNeeded = $false
-                    $processed = Unpack-Files -TargetDir $TargetDir -RawData $text
-
-                    if ($processed) {
-                        [System.Windows.Forms.Clipboard]::Clear()
-                    }
-
-                    # Самообновление: принятый FileTransfer.ps1/setcp.ini применён - перезапускаемся
-                    if ($script:RestartNeeded) { Restart-Listener }
+                } else {
+                    $clipState = "other-text"
                 }
             }
-        } catch {}
+        } catch { $clipState = "clip-error" }
 
         # ===== Синхронизация папки между контурами =====
-        if ($script:DiskSyncEnabled -and (((Get-Date) - $lastSyncScan).TotalMilliseconds -ge $script:SyncPollMs)) {
+        # Скан пропускаем, пока в буфере лежит наш собственный пакет (ждём ACK другого контура).
+        $scanDone = $false
+        if (-not $skipScan -and $script:DiskSyncEnabled -and (((Get-Date) - $lastSyncScan).TotalMilliseconds -ge $script:SyncPollMs)) {
             $lastSyncScan = Get-Date
+            $scanDone = $true
             try {
                 Scan-SyncDir
             } catch {
@@ -771,6 +841,18 @@ function Watch-Clipboard {
         if ($script:KeepAliveMinutes -gt 0 -and (((Get-Date) - $lastKeepAlive).TotalMinutes -ge $script:KeepAliveMinutes)) {
             $lastKeepAlive = Get-Date
             try { Send-KeepAlive } catch {}
+        }
+
+        # ===== Диагностика: heartbeat / trace =====
+        $nextScanMs = if ($script:DiskSyncEnabled) {
+            [math]::Max(0, [int]($script:SyncPollMs - ((Get-Date) - $lastSyncScan).TotalMilliseconds))
+        } else { -1 }
+
+        if ($script:WatchTrace) {
+            Write-Log "TRACE: clip=$clipState, scan=$scanDone, nextScanIn=$nextScanMs ms, keepAliveEvery=$($script:KeepAliveMinutes) min" "DarkGray"
+        } elseif ($script:WatchHeartbeatSec -gt 0 -and (((Get-Date) - $lastHeartbeat).TotalSeconds -ge $script:WatchHeartbeatSec)) {
+            $lastHeartbeat = Get-Date
+            Write-Log "Watch alive: clip=$clipState, next disk scan in $nextScanMs ms, files in sync memory: $($script:SyncHandled.Count)" "DarkGray"
         }
     }
 }
