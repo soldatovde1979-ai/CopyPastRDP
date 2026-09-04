@@ -871,7 +871,7 @@ function Watch-Clipboard {
                 $text = [System.Windows.Forms.Clipboard]::GetText()
                 if ([string]::IsNullOrWhiteSpace($text)) {
                     $clipState = "empty"
-                } elseif ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA)"') {
+                } elseif ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA|FILE_DISK_CMD)"') {
 
                     # Свой-чужой: пакет с Origin = имя этого же ПК положен локально этим же скриптом.
                     # Он предназначен для Watch на ДРУГОМ конце RDP - не трогаем буфер, ждём его.
@@ -882,14 +882,25 @@ function Watch-Clipboard {
                         $clipState = "foreign-packet"
                         $script:HasError = $false
                         $script:RestartNeeded = $false
-                        $processed = Unpack-Files -TargetDir $TargetDir -RawData $text
 
-                        if ($processed) {
-                            [System.Windows.Forms.Clipboard]::Clear()
+                        # Команда управления (не файл): FILE_DISK_CMD - очистить SyncDir на этом контуре.
+                        # Подтверждение (ACK) - очистка буфера, её ждёт отправитель команды.
+                        if ($text -match '"Marker"\s*:\s*"FILE_DISK_CMD"') {
+                            if ($text -match '"Action"\s*:\s*"ClearDisk"') {
+                                $removedHere = Clear-SyncDirLocal
+                                Write-Log "CLEAR-DISK: remote command received - '$($script:SyncDir)' cleared ($removedHere item(s) removed)" "Cyan"
+                                [System.Windows.Forms.Clipboard]::Clear()
+                            }
+                        } else {
+                            $processed = Unpack-Files -TargetDir $TargetDir -RawData $text
+
+                            if ($processed) {
+                                [System.Windows.Forms.Clipboard]::Clear()
+                            }
+
+                            # Самообновление: принятый FileTransfer.ps1/setcp.ini применён - перезапускаемся
+                            if ($script:RestartNeeded) { Restart-Listener }
                         }
-
-                        # Самообновление: принятый FileTransfer.ps1/setcp.ini применён - перезапускаемся
-                        if ($script:RestartNeeded) { Restart-Listener }
                     }
                 } else {
                     $clipState = "other-text"
@@ -1136,11 +1147,98 @@ function Invoke-Resend {
     Restart-WatchIfRunning
 }
 
+function Clear-SyncDirLocal {
+    # Удаляет ВСЁ содержимое SyncDir (файлы и подпапки), включая change.log,
+    # и создаёт пустой change.log заново (чтобы при перезапуске слушателя
+    # не выполнился снапшот). Возвращает число удалённых элементов.
+    $removed = 0
+    if (Test-Path $script:SyncDir) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $script:SyncDir -Force -ErrorAction SilentlyContinue)) {
+            try {
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+                $removed++
+            } catch {
+                Write-Log "CLEAR-DISK: cannot remove '$($item.FullName)' - $($_.Exception.Message)" "Yellow"
+            }
+        }
+    }
+    $script:ChangeLog   = @{}
+    $script:LastLocked  = @{}
+    if (-not (Test-Path $script:SyncDir)) { New-Item -ItemType Directory -Path $script:SyncDir -Force | Out-Null }
+    $script:ChangeLogPath = Join-Path $script:SyncDir "change.log"
+    try { Set-Content -LiteralPath $script:ChangeLogPath -Value "" -Encoding UTF8 } catch {}
+    return $removed
+}
+
+function Invoke-ClearDisk {
+    # FileTransfer.ps1 ClearDisk - очистить папку SyncDir на ОБОИХ контурах одной командой.
+    # Локально содержимое удаляется сразу; на другой контур уходит пакет FILE_DISK_CMD,
+    # который его слушатель выполняет и подтверждает очисткой буфера (ACK).
+    # Если слушатель на другом конце выключен - пакет забирается обратно по таймауту.
+    if (-not (Test-Path $script:SyncDir)) {
+        Write-Log "CLEAR-DISK: SyncDir '$($script:SyncDir)' not found - nothing to clear" "Yellow"
+        return
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+
+    $removedLocal = Clear-SyncDirLocal
+    Write-Log "CLEAR-DISK: local '$($script:SyncDir)' cleared ($removedLocal item(s) removed)" "Cyan"
+
+    # Перезапускаем локального слушателя, чтобы его in-memory журнал не ссылался на удалённые файлы.
+    Restart-WatchIfRunning
+
+    $payload = @{
+        Marker = "FILE_DISK_CMD"
+        Action = "ClearDisk"
+        Origin = $env:COMPUTERNAME
+    }
+    $json = $payload | ConvertTo-Json -Compress
+
+    $clipOk = $false
+    $attempts = $script:ClipRetryAttempts
+    while ($attempts -gt 0 -and -not $clipOk) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($json)
+            $clipOk = $true
+        } catch {
+            $attempts--
+            Start-Sleep -Milliseconds $script:ClipRetryDelayMs
+        }
+    }
+    if (-not $clipOk) {
+        Write-Log "CLEAR-DISK: cannot write command to clipboard! Remote side was NOT cleared." "Red"
+        $script:HasError = $true
+        return
+    }
+    Write-Log "CLEAR-DISK: command sent - waiting for remote listener to clear its SyncDir..." "Cyan"
+
+    $deadline = (Get-Date).AddSeconds($script:SyncAckTimeoutSec)
+    $acked = $false
+    while ($true) {
+        Start-Sleep -Milliseconds $script:PollIntervalMs
+        try {
+            if (-not [System.Windows.Forms.Clipboard]::ContainsText()) { $acked = $true; break }
+        } catch { break }
+        if ((Get-Date) -gt $deadline) {
+            try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
+            break
+        }
+    }
+
+    if ($acked) {
+        Write-Log "CLEAR-DISK: remote listener confirmed - SyncDir is empty on BOTH sides" "Green"
+        [System.Media.SystemSounds]::Asterisk.Play()
+    } else {
+        Write-Log "CLEAR-DISK: no ACK from remote listener (is it running?). Local SyncDir is cleared; run ClearDisk again when the remote listener is up." "Yellow"
+        $script:HasError = $true
+    }
+}
+
 # ===== РАЗБОР АРГУМЕНТОВ И ДИСПЕТЧЕР =====
 $Action = $null
 $Paths  = @()
 foreach ($arg in $Targets) {
-    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend")) {
+    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend", "ClearDisk")) {
         $Action = $arg
     } else {
         $Paths += $arg
@@ -1191,6 +1289,9 @@ elseif ($Action -eq "DelLocal") {
 }
 elseif ($Action -eq "Resend") {
     Invoke-Resend -Masks $Paths
+}
+elseif ($Action -eq "ClearDisk") {
+    Invoke-ClearDisk
 }
 elseif ($Paths.Count -gt 0) {
     Pack-Files -Paths $Paths
