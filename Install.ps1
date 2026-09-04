@@ -10,7 +10,11 @@
 # ===============================================================================
 
 param(
-    [string]$Destination = "C:\CHANGE"
+    [string]$Destination = "C:\CHANGE",
+    # Локальные настройки ЭТОГО контура: "Key=Value;Key2=Value2" (секция [Settings]).
+    # Пишутся в C:\CHANGE\setcp.local.ini, который НЕ копируется в SyncDir и
+    # не перезаписывается самообновлением. Пример: -LocalSettings "KeepAliveMinutes=1"
+    [string]$LocalSettings = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,6 +100,42 @@ if (-not (Test-Path $iniSource -PathType Leaf)) {
     }
 }
 
+# ===== 3.2 Локальные настройки контура (setcp.local.ini) =====
+# setcp.local.ini приоритетнее общего setcp.ini и НЕ попадает в SyncDir,
+# поэтому отличия контуров не уходят на другой контур и не затираются обновлением.
+if ($LocalSettings.Trim() -ne "") {
+    $localFile = Join-Path $Destination "setcp.local.ini"
+    if (-not (Test-Path -LiteralPath $localFile)) {
+        Set-Content -LiteralPath $localFile -Encoding UTF8 -Value @(
+            "; setcp.local.ini - ЛОКАЛЬНЫЕ настройки ЭТОГО контура (создан Install.ps1)",
+            "; Значения приоритетнее setcp.ini. Файл НЕ синхронизируется через SyncDir",
+            "; и не перезаписывается самообновлением.",
+            "; Управление: FileTransfer.ps1 SetLocal / DelLocal / LocalShow",
+            "[Settings]"
+        )
+    }
+    $localLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @(Get-Content -LiteralPath $localFile -Encoding UTF8)) { $localLines.Add($line) }
+    foreach ($pair in ($LocalSettings -split ';')) {
+        $pair = $pair.Trim()
+        if ($pair -eq "") { continue }
+        if ($pair -notmatch '^([^=]+)=(.*)$') {
+            Write-Step "ПРЕДУПРЕЖДЕНИЕ: неверный формат -LocalSettings '$pair' (нужно Key=Value)" "Yellow"
+            continue
+        }
+        $key   = $matches[1].Trim()
+        $value = $matches[2].Trim()
+        $idx   = -1
+        for ($i = 0; $i -lt $localLines.Count; $i++) {
+            if ($localLines[$i] -match '^\s*' + [regex]::Escape($key) + '\s*=') { $idx = $i; break }
+        }
+        if ($idx -ge 0) { $localLines[$idx] = "$key=$value" }
+        else            { $localLines.Add("$key=$value") }
+    }
+    Set-Content -LiteralPath $localFile -Value $localLines -Encoding UTF8
+    Write-Step "Локальные настройки контура записаны в $localFile (в SyncDir не попадают)" "Green"
+}
+
 # ===== 4. Запуск создания ярлыков (если CreateShortcuts.ps1 рядом) =====
 $shortcutScript = Join-Path $PSScriptRoot "CreateShortcuts.ps1"
 if (Test-Path $shortcutScript -PathType Leaf) {
@@ -132,6 +172,9 @@ try {
 }
 
 # ===== 6. Распространение обновлений на другой контур через SyncDir =====
+# В SyncDir уходят ТОЛЬКО общие файлы FileTransfer.ps1 и setcp.ini.
+# setcp.local.ini НЕ копируется: локальные настройки контура (например, keep-alive)
+# остаются на месте и не затираются на другом контуре.
 # Копируем обновлённые FileTransfer.ps1 и setcp.ini в папку синхронизации:
 # слушатель на ЭТОМ контуре отправит их чанками на тот же путь в другом контуре,
 # а слушатель-приёмник с AutoUpdate=1 применит их и перезапустится.
@@ -157,4 +200,4 @@ try {
 }
 
 Write-Step "`nУстановка завершена!" "Cyan"
-pause
+

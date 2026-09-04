@@ -25,6 +25,14 @@ param(
 # Другой файл можно указать параметром: -Config "путь\к\файлу.ini"
 $script:ConfigPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot "setcp.ini" }
 
+# Локальные настройки ЭТОГО контура: setcp.local.ini (или <имя>.local.<расширение>)
+# рядом с основным INI. Значения из него имеют ПРИОРИТЕТ над общим setcp.ini.
+# Файл НЕ копируется в SyncDir при установке и НЕ перезаписывается самообновлением,
+# поэтому отличия контуров (например, keep-alive на внутреннем) не затираются.
+# Управление: FileTransfer.ps1 SetLocal / DelLocal / LocalShow.
+$script:LocalConfigPath = Join-Path (Split-Path -Parent $script:ConfigPath) `
+    ([System.IO.Path]::GetFileNameWithoutExtension($script:ConfigPath) + ".local" + [System.IO.Path]::GetExtension($script:ConfigPath))
+
 function Get-IniContent {
     param([string]$Path)
     $ini = @{}
@@ -55,6 +63,11 @@ function Get-IniContent {
 }
 
 $script:Ini = Get-IniContent -Path $script:ConfigPath
+$script:LocalIni = Get-IniContent -Path $script:LocalConfigPath
+foreach ($sec in $script:LocalIni.Keys) {
+    if (-not $script:Ini.ContainsKey($sec)) { $script:Ini[$sec] = @{} }
+    foreach ($key in $script:LocalIni[$sec].Keys) { $script:Ini[$sec][$key] = $script:LocalIni[$sec][$key] }
+}
 
 function Get-IniValue {
     param([string]$Section, [string]$Key, [string]$Default = "")
@@ -76,7 +89,10 @@ function Get-IniBool {
     param([string]$Section, [string]$Key, [bool]$Default)
     $v = Get-IniValue -Section $Section -Key $Key -Default ""
     if ($v -eq "") { return $Default }
-    return ($v -in @("1", "true", "yes", "on"))
+    # Числовые значения: 0 — false, любое ненулевое (в т.ч. 1000) — true.
+    # Защищает от опечаток вида "DiskSyncEnabled=1000" вместо "1".
+    if ($v -match '^\s*[+-]?\d+\s*$') { return ([long]$v -ne 0) }
+    return ($v.ToLowerInvariant() -in @("true", "yes", "on", "y", "1"))
 }
 
 # Приоритет чисел: аргумент командной строки -> INI -> значение по умолчанию
@@ -829,7 +845,11 @@ function Watch-Clipboard {
     Stop-OldListeners
 
     Write-Log "Started WATCH mode. Listening..." "Magenta"
-    if ($script:DiskSyncEnabled) { Write-Log "SYNC: disk sync ENABLED, watching '$($script:SyncDir)'..." "Magenta" }
+    if ($script:DiskSyncEnabled) {
+        Write-Log "SYNC: disk sync ENABLED, watching '$($script:SyncDir)'..." "Magenta"
+    } else {
+        Write-Log "SYNC: disk sync DISABLED (DiskSyncEnabled=0) - files in '$($script:SyncDir)' will NOT be sent" "DarkGray"
+    }
     if ($script:KeepAliveMinutes -gt 0) { Write-Log "KeepAlive: enabled, every $($script:KeepAliveMinutes) min" "Magenta" }
     if ($script:WatchTrace) { Write-Log "TRACE: verbose logging enabled (each poll cycle)" "DarkGray" }
     if ($script:WatchHeartbeatSec -gt 0) { Write-Log "Heartbeat: every $($script:WatchHeartbeatSec) sec" "DarkGray" }
@@ -902,21 +922,229 @@ function Watch-Clipboard {
         } else { -1 }
 
         if ($script:WatchTrace) {
-            Write-Log "TRACE: clip=$clipState, scan=$scanDone, nextScanIn=$nextScanMs ms, keepAliveEvery=$($script:KeepAliveMinutes) min" "DarkGray"
+            $scanInfo = if ($script:DiskSyncEnabled) { "scan=$scanDone, nextScanIn=$nextScanMs ms" } else { "disk sync DISABLED" }
+            Write-Log "TRACE: clip=$clipState, $scanInfo, keepAliveEvery=$($script:KeepAliveMinutes) min" "DarkGray"
         } elseif ($script:WatchHeartbeatSec -gt 0 -and (((Get-Date) - $lastHeartbeat).TotalSeconds -ge $script:WatchHeartbeatSec)) {
             $lastHeartbeat = Get-Date
-            Write-Log "Watch alive: clip=$clipState, next disk scan in $nextScanMs ms, change.log records: $($script:ChangeLog.Count)" "DarkGray"
+            $scanInfo = if ($script:DiskSyncEnabled) { "next disk scan in $nextScanMs ms" } else { "disk sync DISABLED" }
+            Write-Log "Watch alive: clip=$clipState, $scanInfo, change.log records: $($script:ChangeLog.Count)" "DarkGray"
         }
     }
+}
+
+# ===== ЛОКАЛЬНЫЕ НАСТРОЙКИ КОНТУРА (setcp.local.ini) =====
+
+function Read-IniItems {
+    # Построчное чтение INI в список элементов с сохранением комментариев и порядка.
+    param([string]$Path)
+    $items = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $Path)) { return $items }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $text  = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    } else {
+        [System.Text.Encoding]::UTF8.GetString($bytes)
+    }
+    $section = ""
+    foreach ($raw in ($text -split "`r?`n")) {
+        $line  = $raw.TrimEnd("`r")
+        $trim  = $line.Trim()
+        if ($trim -eq "") {
+            $items.Add([pscustomobject]@{ Kind = "blank"; Text = $line; Section = $section; Key = "" })
+            continue
+        }
+        if ($trim.StartsWith(";") -or $trim.StartsWith("#")) {
+            $items.Add([pscustomobject]@{ Kind = "comment"; Text = $line; Section = $section; Key = "" })
+            continue
+        }
+        if ($trim -match '^\[(.+)\]$') {
+            $section = $matches[1].Trim()
+            $items.Add([pscustomobject]@{ Kind = "section"; Text = $line; Section = $section; Key = "" })
+            continue
+        }
+        if ($trim -match '^([^=]+?)\s*=\s*(.*)$') {
+            $items.Add([pscustomobject]@{ Kind = "key"; Text = $line; Section = $section; Key = $matches[1].Trim(); Value = $matches[2].Trim() })
+        } else {
+            $items.Add([pscustomobject]@{ Kind = "comment"; Text = $line; Section = $section; Key = "" })
+        }
+    }
+    return $items
+}
+
+function Save-IniItems {
+    param([string]$Path, $items)
+    $lines = @($items | ForEach-Object { $_.Text })
+    Set-Content -LiteralPath $Path -Value $lines -Encoding UTF8
+}
+
+function Set-IniKeyItem {
+    # Обновляет ключ в секции (если секции/ключа нет - добавляет), сохраняя порядок и комментарии.
+    param($items, [string]$Section, [string]$Key, [string]$Value)
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($items[$i].Kind -eq "key" -and $items[$i].Section -ieq $Section -and $items[$i].Key -ieq $Key) {
+            $items[$i] = [pscustomobject]@{ Kind = "key"; Text = "$Key=$Value"; Section = $Section; Key = $Key; Value = $Value }
+            return
+        }
+    }
+    $newItem = [pscustomobject]@{ Kind = "key"; Text = "$Key=$Value"; Section = $Section; Key = $Key; Value = $Value }
+    $lastKeyIdx = -1
+    $sectIdx    = -1
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($items[$i].Kind -eq "section" -and $items[$i].Section -ieq $Section) { $sectIdx = $i }
+        elseif ($items[$i].Kind -eq "key" -and $items[$i].Section -ieq $Section) { $lastKeyIdx = $i }
+    }
+    if ($lastKeyIdx -ge 0) { $items.Insert($lastKeyIdx + 1, $newItem) }
+    elseif ($sectIdx -ge 0) { $items.Insert($sectIdx + 1, $newItem) }
+    else {
+        $items.Add([pscustomobject]@{ Kind = "section"; Text = "[$Section]"; Section = $Section; Key = "" })
+        $items.Add($newItem)
+    }
+}
+
+function Remove-IniKeyItem {
+    # Удаляет ключ из секции; если Key пустой - удаляет всю секцию. Возвращает число удалённых ключей.
+    param($items, [string]$Section, [string]$Key)
+    $removed = 0
+    for ($i = $items.Count - 1; $i -ge 0; $i--) {
+        if ($items[$i].Kind -eq "key" -and $items[$i].Section -ieq $Section -and $items[$i].Key -ieq $Key) {
+            $items.RemoveAt($i)
+            $removed++
+        }
+    }
+    if ($Key -eq "") {
+        for ($i = $items.Count - 1; $i -ge 0; $i--) {
+            if ($items[$i].Kind -eq "section" -and $items[$i].Section -ieq $Section) { $items.RemoveAt($i) }
+        }
+    }
+    return $removed
+}
+
+function Restart-WatchIfRunning {
+    # Если фоновый слушатель работает - перезапускаем его, чтобы изменения настроек
+    # или журнала change.log вступили в силу немедленно.
+    $running = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*FileTransfer.ps1*Watch*" })
+    if ($running.Count -eq 0) { return }
+    foreach ($proc in $running) {
+        try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop } catch {}
+    }
+    Start-Sleep -Milliseconds 500
+    $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    try {
+        Start-Process -FilePath $psExe `
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" Watch" `
+            -WorkingDirectory (Split-Path -Parent $PSCommandPath) | Out-Null
+        Write-Log "Watch: listener restarted to apply settings" "Cyan"
+    } catch {
+        Write-Log "Watch: failed to restart listener - $($_.Exception.Message)" "Red"
+    }
+}
+
+function Invoke-LocalShow {
+    Write-Log "LOCAL: common config : $($script:ConfigPath)" "Cyan"
+    if (Test-Path -LiteralPath $script:LocalConfigPath) {
+        Write-Log "LOCAL: per-host file : $($script:LocalConfigPath) (overrides common values)" "Cyan"
+    } else {
+        Write-Log "LOCAL: per-host file does not exist - all values come from the common config" "DarkGray"
+    }
+    foreach ($sec in ($script:Ini.Keys | Sort-Object)) {
+        Write-Log "LOCAL: [$sec]" "Cyan"
+        foreach ($key in ($script:Ini[$sec].Keys | Sort-Object)) {
+            $src = if ($script:LocalIni.ContainsKey($sec) -and $script:LocalIni[$sec].ContainsKey($key)) { " (local)" } else { "" }
+            Write-Log ("LOCAL:   {0}={1}{2}" -f $key, $script:Ini[$sec][$key], $src) "Gray"
+        }
+    }
+}
+
+function Invoke-SetLocal {
+    # FileTransfer.ps1 SetLocal <Section> <Key> <Value> - записать локальную настройку контура.
+    param([string]$Section, [string]$Key, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Section) -or [string]::IsNullOrWhiteSpace($Key) -or $null -eq $Value) {
+        Write-Log "ERROR: SetLocal: usage: FileTransfer.ps1 SetLocal <Section> <Key> <Value>" "Red"
+        $script:HasError = $true
+        return
+    }
+    $items = Read-IniItems -Path $script:LocalConfigPath
+    if ($items.Count -eq 0) {
+        $items.Add([pscustomobject]@{ Kind = "comment"; Text = "; setcp.local.ini - ЛОКАЛЬНЫЕ настройки ЭТОГО контура (создан командой SetLocal)"; Section = ""; Key = "" })
+        $items.Add([pscustomobject]@{ Kind = "comment"; Text = "; Значения приоритетнее setcp.ini. Файл НЕ синхронизируется через SyncDir и не перезаписывается самообновлением."; Section = ""; Key = "" })
+        $items.Add([pscustomobject]@{ Kind = "blank"; Text = ""; Section = ""; Key = "" })
+    }
+    Set-IniKeyItem -items $items -Section $Section -Key $Key -Value $Value
+    Save-IniItems -Path $script:LocalConfigPath -items $items
+    Write-Log "LOCAL: $($script:LocalConfigPath): [$Section] $Key=$Value" "Green"
+    Restart-WatchIfRunning
+}
+
+function Invoke-DelLocal {
+    # FileTransfer.ps1 DelLocal <Section> [Key] - удалить ключ (или всю секцию без Key).
+    param([string]$Section, [string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Section)) {
+        Write-Log "ERROR: DelLocal: usage: FileTransfer.ps1 DelLocal <Section> [Key]" "Red"
+        $script:HasError = $true
+        return
+    }
+    if (-not (Test-Path -LiteralPath $script:LocalConfigPath)) {
+        Write-Log "LOCAL: nothing to delete - $($script:LocalConfigPath) does not exist" "Yellow"
+        return
+    }
+    $items   = Read-IniItems -Path $script:LocalConfigPath
+    $removed = Remove-IniKeyItem -items $items -Section $Section -Key $Key
+    Save-IniItems -Path $script:LocalConfigPath -items $items
+    $what = if ($Key) { "[$Section] $Key" } else { "section [$Section]" }
+    Write-Log "LOCAL: removed $what ($removed key(s))" "Green"
+    Restart-WatchIfRunning
+}
+
+function Invoke-Resend {
+    # FileTransfer.ps1 Resend [маска1 маска2 ...] - стереть записи change.log,
+    # чтобы файлы (все или по маскам) были отправлены заново при следующем скане.
+    # Пустой change.log при перезапуске слушателя НЕ приводит к снапшоту: файлы,
+    # лежащие в SyncDir, считаются новыми и отправляются.
+    param([string[]]$Masks)
+    if (-not $script:DiskSyncEnabled) {
+        Write-Log "RESEND: disk sync is DISABLED (DiskSyncEnabled=0) - nothing to resend" "Yellow"
+        return
+    }
+    if (-not (Test-Path $script:SyncDir)) {
+        Write-Log "RESEND: SyncDir '$($script:SyncDir)' not found" "Yellow"
+        return
+    }
+    $logPath = Join-Path $script:SyncDir "change.log"
+    if (-not (Test-Path -LiteralPath $logPath)) {
+        Set-Content -LiteralPath $logPath -Value "" -Encoding UTF8
+        Write-Log "RESEND: change.log created empty - all files in SyncDir will be sent on next listener start" "Cyan"
+    } else {
+        $kept = New-Object System.Collections.Generic.List[string]
+        $removed = 0
+        foreach ($line in @(Get-Content -LiteralPath $logPath -Encoding UTF8)) {
+            $m = [regex]::Match($line, '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\|(SENT|RECEIVED|SNAPSHOT|LOCKED)\|(.+)\|\d+\|\d+$')
+            if (-not $m.Success) { continue }
+            $hit = ($Masks.Count -eq 0)
+            if (-not $hit) {
+                foreach ($mask in $Masks) { if ($m.Groups[2].Value -like $mask) { $hit = $true; break } }
+            }
+            if ($hit) { $removed++ } else { $kept.Add($line) }
+        }
+        Set-Content -LiteralPath $logPath -Value $kept -Encoding UTF8
+        if ($removed -eq 0) {
+            Write-Log "RESEND: no records match - change.log untouched" "Yellow"
+        } else {
+            Write-Log "RESEND: $removed record(s) removed from change.log - affected files will be sent on next scan" "Cyan"
+        }
+    }
+    Restart-WatchIfRunning
 }
 
 # ===== РАЗБОР АРГУМЕНТОВ И ДИСПЕТЧЕР =====
 $Action = $null
 $Paths  = @()
 foreach ($arg in $Targets) {
-    # Добавлен PackAuto
-    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch")) { $Action = $arg }
-    else { $Paths += $arg }
+    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend")) {
+        $Action = $arg
+    } else {
+        $Paths += $arg
+    }
 }
 
 $script:CurrentAction = if ($Action) { $Action } else { "SendFile" }
@@ -950,6 +1178,19 @@ elseif ($Action -eq "UnpackTo") {
         Write-Log "ERROR: No target path given for UnpackTo!" "Red"
         $script:HasError = $true
     }
+}
+elseif ($Action -eq "LocalShow") {
+    Invoke-LocalShow
+}
+elseif ($Action -eq "SetLocal") {
+    $val = if ($Paths.Count -ge 3) { ($Paths | Select-Object -Skip 2) -join " " } else { $null }
+    Invoke-SetLocal -Section $Paths[0] -Key $Paths[1] -Value $val
+}
+elseif ($Action -eq "DelLocal") {
+    Invoke-DelLocal -Section $Paths[0] -Key $Paths[1]
+}
+elseif ($Action -eq "Resend") {
+    Invoke-Resend -Masks $Paths
 }
 elseif ($Paths.Count -gt 0) {
     Pack-Files -Paths $Paths

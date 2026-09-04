@@ -109,4 +109,3 @@ Write-Host "$listenerVerb : СЛУШАТЕЛЬ -> FileTransfer.ps1 Watch (Авт
 
 Write-Host "`nГотово! Ярлыки находятся в: $SendTo" -ForegroundColor Cyan
 Write-Host "Слушатель в Автозагрузке: $listenerPath" -ForegroundColor Cyan
-pause
