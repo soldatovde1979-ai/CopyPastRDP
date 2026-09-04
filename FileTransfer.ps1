@@ -138,10 +138,11 @@ $script:RestartNeeded = $false
 # Занятые файлы SyncDir (для логирования только перехода состояния, без спама каждую секунду)
 $script:LastLocked = @{}
 
-# Файлы, уже отправленные/принятые в режиме синхронизации: ключ "relpath|длина|LastWriteTimeUtc"
-# -> момент обработки. Нужно для защиты от петель (принятый файл не отправляется обратно)
-# и от повторной отправки неизменённых файлов.
-$script:SyncHandled = @{}
+# Персистентный журнал диска change.log (внутри SyncDir): ключ "relpath|длина|LastWriteTimeUtc"
+# -> тип записи (SNAPSHOT/SENT/RECEIVED/LOCKED). Заменяет in-memory-память: что отправлено
+# или принято, переживает перезапуск слушателя и защищает от петель.
+$script:ChangeLog     = @{}
+$script:ChangeLogPath = $null
 
 if (-not (Test-Path $IN_DIR))  { New-Item -ItemType Directory -Path $IN_DIR  -Force | Out-Null }
 if (-not (Test-Path $OUT_DIR)) { New-Item -ItemType Directory -Path $OUT_DIR -Force | Out-Null }
@@ -512,7 +513,7 @@ function Unpack-Files {
             if ($syncRel) {
                 # Помечаем принятый файл как обработанный, чтобы не отправить его обратно (петля)
                 $item = Get-Item $finalPath -ErrorAction SilentlyContinue
-                if ($item) { Add-SyncHandled -Key (Get-SyncKey -Item $item -RelPath $syncRel) }
+                if ($item) { Add-ChangeEntry -Type "RECEIVED" -RelPath $syncRel -Item $item }
                 Write-Log "SUCCESS: Sync file '$syncRel' completely assembled!" "Green"
 
                 # Самообновление: файлы FileTransfer.ps1 / setcp.ini, пришедшие в корень SyncDir,
@@ -556,18 +557,15 @@ function Get-SyncKey {
     return ("{0}|{1}|{2}" -f ($RelPath.ToLowerInvariant() -replace '\\', '/'), $Item.Length, $Item.LastWriteTimeUtc.Ticks)
 }
 
-function Add-SyncHandled {
-    param([string]$Key)
-    if ($script:SyncHandled.Count -ge 1000) {
-        # Периодическая очистка устаревших записей (старше 1 часа)
-        $cutoff = (Get-Date).AddHours(-1)
-        $fresh = @{}
-        foreach ($k in $script:SyncHandled.Keys) {
-            if ($script:SyncHandled[$k] -gt $cutoff) { $fresh[$k] = $script:SyncHandled[$k] }
-        }
-        $script:SyncHandled = $fresh
-    }
-    $script:SyncHandled[$Key] = Get-Date
+function Add-ChangeEntry {
+    # Дописывает строку в персистентный журнал change.log (внутри SyncDir)
+    # и обновляет in-memory журнал $script:ChangeLog.
+    param([string]$Type, [string]$RelPath, [System.IO.FileInfo]$Item)
+    $key = Get-SyncKey -Item $Item -RelPath $RelPath
+    $script:ChangeLog[$key] = $Type
+    if (-not $script:ChangeLogPath) { return }
+    $line = "{0}|{1}|{2}|{3}|{4}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Type, ($RelPath -replace '\\', '/'), $Item.Length, $Item.LastWriteTimeUtc.Ticks
+    try { Add-Content -LiteralPath $script:ChangeLogPath -Value $line -Encoding UTF8 } catch {}
 }
 
 function Test-FileFree {
@@ -583,17 +581,48 @@ function Test-FileFree {
     }
 }
 
-function Initialize-SyncSnapshot {
-    # При старте Watch всё, что уже лежит в SyncDir, считается синхронизированным,
-    # чтобы после перезапуска слушателя не слать всё заново и не плодить петли.
+function Initialize-ChangeLog {
+    # Загрузка/создание персистентного журнала change.log внутри SyncDir.
+    # Журнал хранит, что уже отправлено/принято, и переживает перезапуск слушателя.
     if (-not $script:DiskSyncEnabled) { return }
     if (-not (Test-Path $script:SyncDir)) { return }
-    $count = 0
-    Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-        Add-SyncHandled -Key (Get-SyncKey -Item $_ -RelPath (Get-RelPath -FullName $_.FullName))
-        $count++
+    $script:ChangeLogPath = Join-Path $script:SyncDir "change.log"
+    $script:ChangeLog     = @{}
+
+    $loaded = 0
+    if (Test-Path -LiteralPath $script:ChangeLogPath) {
+        foreach ($line in @(Get-Content -LiteralPath $script:ChangeLogPath -Encoding UTF8)) {
+            if ($line -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\|(SENT|RECEIVED|SNAPSHOT|LOCKED)\|(.+)\|(\d+)\|(\d+)$') {
+                $script:ChangeLog["$($matches[2])|$($matches[3])|$($matches[4])"] = $matches[1]
+                $loaded++
+            }
+        }
     }
-    if ($count -gt 0) { Write-Log "SYNC: $count file(s) already in '$($script:SyncDir)' marked as synchronized." "DarkGray" }
+
+    # Первый запуск (журнала нет) или журнал разросся: пересоздаём из актуальных файлов папки —
+    # всё, что лежит на диске, помечается SNAPSHOT (считается синхронизированным).
+    $rebuild = -not (Test-Path -LiteralPath $script:ChangeLogPath)
+    if (-not $rebuild) {
+        $lineCount = @(Get-Content -LiteralPath $script:ChangeLogPath -Encoding UTF8).Count
+        if ($lineCount -gt 2000) { $rebuild = $true }
+    }
+
+    if ($rebuild) {
+        Set-Content -LiteralPath $script:ChangeLogPath -Value "" -Encoding UTF8
+        $script:ChangeLog = @{}
+        $count = 0
+        Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ine 'change.log' -and $_.Extension -ne '.part' } |
+            ForEach-Object {
+                Add-ChangeEntry -Type "SNAPSHOT" -RelPath (Get-RelPath -FullName $_.FullName) -Item $_
+                $count++
+            }
+        Write-Log "SYNC: change.log created/rotated, $count file(s) marked as snapshot." "DarkGray"
+    } elseif ($loaded -gt 0) {
+        Write-Log "SYNC: change.log loaded ($loaded records)." "DarkGray"
+    }
+    # Файлы, которых нет в журнале, считаются новыми и будут отправлены
+    # при первом же сканировании (даже если слушатель был выключен).
 }
 
 function Wait-SyncAck {
@@ -692,13 +721,16 @@ function Send-SyncFile {
 
 function Scan-SyncDir {
     # Периодический просмотр SyncDir: новый свободный файл -> отправка чанками
-    # на такой же относительный путь в другом контуре.
+    # на такой же относительный путь в другом контуре. Состояние "что уже
+    # отправлено/принято" берётся из персистентного журнала change.log.
     if (-not (Test-Path $script:SyncDir)) {
         if ($script:WatchTrace) { Write-Log "TRACE: SyncDir '$($script:SyncDir)' not found" "DarkGray" }
         return
     }
 
-    $files       = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue)
+    # Служебные файлы не отправляются: сам журнал change.log и незавершённые сборки .part
+    $files       = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ine 'change.log' -and $_.Extension -ne '.part' })
     $newCount    = 0
     $handledCount = 0
     $lockedCount = 0
@@ -708,9 +740,9 @@ function Scan-SyncDir {
         $rel = Get-RelPath -FullName $file.FullName
         if ([string]::IsNullOrWhiteSpace($rel)) { continue }
         $key = Get-SyncKey -Item $file -RelPath $rel
-        if ($script:SyncHandled.ContainsKey($key)) {
+        if ($script:ChangeLog.ContainsKey($key) -and $script:ChangeLog[$key] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) {
             $handledCount++
-            if ($script:WatchTrace) { Write-Log "TRACE: skip '$rel' - already processed" "DarkGray" }
+            if ($script:WatchTrace) { Write-Log "TRACE: skip '$rel' - already processed ($($script:ChangeLog[$key]))" "DarkGray" }
             continue
         }
         $newCount++
@@ -719,13 +751,14 @@ function Scan-SyncDir {
             # Занятый файл логируем только при переходе состояния, чтобы не спамить каждую секунду
             if (-not $script:LastLocked.ContainsKey($key)) {
                 Write-Log "SYNC: '$rel' is locked (still being written) - will retry when free" "DarkGray"
+                Add-ChangeEntry -Type "LOCKED" -RelPath $rel -Item $file
                 $script:LastLocked[$key] = $true
             }
             continue
         }
         $script:LastLocked.Remove($key)
         if (Send-SyncFile -File $file -RelPath $rel) {
-            Add-SyncHandled -Key $key
+            Add-ChangeEntry -Type "SENT" -RelPath $rel -Item $file
             $sentCount++
         } else {
             $failedCount++
@@ -802,7 +835,7 @@ function Watch-Clipboard {
     if ($script:WatchHeartbeatSec -gt 0) { Write-Log "Heartbeat: every $($script:WatchHeartbeatSec) sec" "DarkGray" }
     Add-Type -AssemblyName System.Windows.Forms
 
-    Initialize-SyncSnapshot
+    Initialize-ChangeLog
     $lastSyncScan  = Get-Date
     $lastKeepAlive = Get-Date
     $lastHeartbeat = Get-Date
@@ -872,7 +905,7 @@ function Watch-Clipboard {
             Write-Log "TRACE: clip=$clipState, scan=$scanDone, nextScanIn=$nextScanMs ms, keepAliveEvery=$($script:KeepAliveMinutes) min" "DarkGray"
         } elseif ($script:WatchHeartbeatSec -gt 0 -and (((Get-Date) - $lastHeartbeat).TotalSeconds -ge $script:WatchHeartbeatSec)) {
             $lastHeartbeat = Get-Date
-            Write-Log "Watch alive: clip=$clipState, next disk scan in $nextScanMs ms, files in sync memory: $($script:SyncHandled.Count)" "DarkGray"
+            Write-Log "Watch alive: clip=$clipState, next disk scan in $nextScanMs ms, change.log records: $($script:ChangeLog.Count)" "DarkGray"
         }
     }
 }
