@@ -101,6 +101,9 @@ $script:DiskSyncEnabled   = Get-IniBool -Section "Settings" -Key "DiskSyncEnable
 $script:SyncPollMs        = [int](Get-IniValue -Section "Settings" -Key "SyncPollMs"        -Default "1000")
 $script:SyncAckTimeoutSec = [int](Get-IniValue -Section "Settings" -Key "SyncAckTimeoutSec" -Default "60")
 $script:KeepAliveMinutes  = [int](Get-IniValue -Section "Settings" -Key "KeepAliveMinutes"  -Default "0")
+# Самообновление через папку синхронизации: принятые в SyncDir файлы
+# FileTransfer.ps1 / setcp.ini копируются в каталог скрипта и слушатель перезапускается.
+$script:AutoUpdate = Get-IniBool -Section "Settings" -Key "AutoUpdate" -Default $true
 
 # Рабочие каталоги и журнал
 $IN_DIR   = Get-IniPath -Section "Paths" -Key "InDir"   -Default "C:\CHANGE\IN"
@@ -123,6 +126,10 @@ if ($script:Ini.ContainsKey("Routes")) {
 }
 
 $script:HasError = $false
+
+# Флаг самообновления: устанавливается приёмником после применения FileTransfer.ps1/setcp.ini,
+# по нему Watch перезапускает себя с новым кодом.
+$script:RestartNeeded = $false
 
 # Файлы, уже отправленные/принятые в режиме синхронизации: ключ "relpath|длина|LastWriteTimeUtc"
 # -> момент обработки. Нужно для защиты от петель (принятый файл не отправляется обратно)
@@ -480,6 +487,19 @@ function Unpack-Files {
                 $item = Get-Item $finalPath -ErrorAction SilentlyContinue
                 if ($item) { Add-SyncHandled -Key (Get-SyncKey -Item $item -RelPath $syncRel) }
                 Write-Log "SUCCESS: Sync file '$syncRel' completely assembled!" "Green"
+
+                # Самообновление: файлы FileTransfer.ps1 / setcp.ini, пришедшие в корень SyncDir,
+                # применяются в каталог запущенного скрипта, после чего слушатель перезапускается.
+                if ($script:AutoUpdate -and $syncRel -notmatch '/' -and $safeName -in @('FileTransfer.ps1', 'setcp.ini')) {
+                    $rootDir = Split-Path -Parent $PSCommandPath
+                    try {
+                        Copy-Item -Path $finalPath -Destination (Join-Path $rootDir $safeName) -Force
+                        Write-Log "AUTOUPDATE: '$safeName' applied to $rootDir - listener will restart" "Cyan"
+                        $script:RestartNeeded = $true
+                    } catch {
+                        Write-Log "AUTOUPDATE: FAILED to apply '$safeName' - $($_.Exception.Message)" "Red"
+                    }
+                }
             } else {
                 Write-Log "SUCCESS: File '$safeName' completely assembled!" "Green"
             }
@@ -680,6 +700,23 @@ function Send-KeepAlive {
     }
 }
 
+# ===== САМООБНОВЛЕНИЕ (РЕЖИМ WATCH) =====
+
+function Restart-Listener {
+    # Перезапуск Watch с обновлённым кодом/настройками после самообновления.
+    $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    Write-Log "AUTOUPDATE: restarting listener with updated code..." "Cyan"
+    try {
+        Start-Process -FilePath $psExe `
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" Watch" `
+            -WorkingDirectory (Split-Path -Parent $PSCommandPath) | Out-Null
+    } catch {
+        Write-Log "AUTOUPDATE: failed to start new listener - $($_.Exception.Message)" "Red"
+    }
+    Start-Sleep -Milliseconds 300
+    exit 0
+}
+
 # ===== СЛУШАТЕЛЬ (WATCHER) =====
 function Watch-Clipboard {
     param([string]$TargetDir = $IN_DIR)
@@ -707,11 +744,15 @@ function Watch-Clipboard {
                     }
 
                     $script:HasError = $false
+                    $script:RestartNeeded = $false
                     $processed = Unpack-Files -TargetDir $TargetDir -RawData $text
 
                     if ($processed) {
                         [System.Windows.Forms.Clipboard]::Clear()
                     }
+
+                    # Самообновление: принятый FileTransfer.ps1/setcp.ini применён - перезапускаемся
+                    if ($script:RestartNeeded) { Restart-Listener }
                 }
             }
         } catch {}

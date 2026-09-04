@@ -2,8 +2,9 @@
 #  Скрипт: Install.ps1
 #  Назначение: Копирование FileTransfer.ps1 в C:\CHANGE (исходник в репозитории
 #              остаётся), копирование setcp.ini, создание рабочих папок,
-#              запуск CreateShortcuts.ps1 (если он лежит рядом) и ПЕРЕЗАПУСК
-#              фонового СЛУШАТЕЛЯ (Watch), чтобы обновлённый код сразу заработал.
+#              запуск CreateShortcuts.ps1 (если он лежит рядом), ПЕРЕЗАПУСК
+#              фонового СЛУШАТЕЛЯ (Watch) и РАСПРОСТРАНЕНИЕ обновлений на
+#              другой контур через папку синхронизации SyncDir.
 #
 #  Запуск:     powershell -NoProfile -ExecutionPolicy Bypass -File Install.ps1
 # ===============================================================================
@@ -17,6 +18,18 @@ $HasError = $false
 
 function Write-Step([string]$Message, [string]$Color = "White") {
     Write-Host $Message -ForegroundColor $Color
+}
+
+function Get-IniKey {
+    # Чтение значения ключа из INI-файла (секции игнорируются - ищется первое совпадение ключа)
+    param([string]$Path, [string]$Key, [string]$Default = "")
+    if (-not (Test-Path -LiteralPath $Path)) { return $Default }
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        if ($line -match '^\s*' + [regex]::Escape($Key) + '\s*=\s*(.+?)\s*(?:;.*)?$') {
+            return $matches[1].Trim()
+        }
+    }
+    return $Default
 }
 
 # ===== 1. Поиск FileTransfer.ps1 рядом со скриптом установки =====
@@ -116,6 +129,31 @@ try {
     Write-Step "СЛУШАТЕЛЬ запущен заново (PID $($listenerProcess.Id)) — приём файлов и синхронизация активны." "Green"
 } catch {
     Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось запустить СЛУШАТЕЛЯ - $($_.Exception.Message)" "Yellow"
+}
+
+# ===== 6. Распространение обновлений на другой контур через SyncDir =====
+# Копируем обновлённые FileTransfer.ps1 и setcp.ini в папку синхронизации:
+# слушатель на ЭТОМ контуре отправит их чанками на тот же путь в другом контуре,
+# а слушатель-приёмник с AutoUpdate=1 применит их и перезапустится.
+# Пауза нужна, чтобы новый слушатель успел сделать стартовый снапшот SyncDir
+# (иначе он посчитает только что скопированные файлы синхронизированными).
+Start-Sleep -Seconds 2
+
+$syncDir = Get-IniKey -Path $iniTarget -Key "SyncDir" -Default "C:\CHANGE\disk"
+$syncDir = [Environment]::ExpandEnvironmentVariables($syncDir)
+if ($syncDir.Length -gt 3) { $syncDir = $syncDir.TrimEnd('\', '/') }
+
+if (-not (Test-Path $syncDir)) {
+    New-Item -ItemType Directory -Path $syncDir -Force | Out-Null
+    Write-Step "Создана папка синхронизации: $syncDir" "Green"
+}
+
+try {
+    Copy-Item -Path $targetScript -Destination (Join-Path $syncDir "FileTransfer.ps1") -Force
+    Copy-Item -Path $iniTarget -Destination (Join-Path $syncDir "setcp.ini") -Force
+    Write-Step "Обновления скопированы в $syncDir - слушатель отправит их на другой контур автоматически." "Green"
+} catch {
+    Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось скопировать обновления в $syncDir - $($_.Exception.Message)" "Yellow"
 }
 
 Write-Step "`nУстановка завершена!" "Cyan"
