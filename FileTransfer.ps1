@@ -459,11 +459,31 @@ function Unpack-Files {
         if ($syncRel) { $safeName = [System.IO.Path]::GetFileName($syncRel) }
 
         if ($syncRel) {
-            $relDir = Split-Path -Parent $syncRel
-            $syncTarget = if ($relDir) { Join-Path $script:SyncDir $relDir } else { $script:SyncDir }
+            # Диск (SyncDir) — место по умолчанию. Маски из [Routes] приоритетнее:
+            # если имя файла совпало с маской, файл сохраняется в каталог, указанный
+            # в маске (вместо SyncDir).
+            $syncTarget = $null
+            $routeMask  = $null
+            if ($script:RoutesEnabled) {
+                foreach ($route in $script:Routes) {
+                    if ($safeName -like $route.Mask) {
+                        $syncTarget = $route.Target
+                        $routeMask  = $route.Mask
+                        break
+                    }
+                }
+            }
+            if (-not $syncTarget) {
+                $relDir = Split-Path -Parent $syncRel
+                $syncTarget = if ($relDir) { Join-Path $script:SyncDir $relDir } else { $script:SyncDir }
+            }
             if (-not (Test-Path $syncTarget)) { New-Item -ItemType Directory -Path $syncTarget -Force | Out-Null }
             $dest = [pscustomobject]@{ Dir = $syncTarget; Mask = $null }
-            Write-Log "  SYNC: '$safeName' -> $($dest.Dir)" "Cyan"
+            if ($routeMask) {
+                Write-Log "  SYNC-ROUTE: '$safeName' matches '$routeMask' -> $($dest.Dir)" "Cyan"
+            } else {
+                Write-Log "  SYNC: '$safeName' -> $($dest.Dir)" "Cyan"
+            }
         } else {
             $dest = Resolve-Destination -FileName $safeName -TargetDir $TargetDir -NoRoutes:$NoRoutes
             if ($dest.Mask) { Write-Log "  ROUTE: '$safeName' matches '$($dest.Mask)' -> $($dest.Dir)" "Cyan" }
