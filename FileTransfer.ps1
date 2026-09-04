@@ -107,6 +107,9 @@ if (-not $PSBoundParameters.ContainsKey('ChunkSizeMB')) {
 $script:WarningSizeMB          = [double](Get-IniValue -Section "Settings" -Key "WarningSizeMB"     -Default "15")
 $script:MaxLogLines            = [int](Get-IniValue    -Section "Settings" -Key "MaxLogLines"       -Default "500")
 $script:PollIntervalMs         = [int](Get-IniValue    -Section "Settings" -Key "PollIntervalMs"    -Default "400")
+# Окно «свежести» файлов в InDir для ручного приёма (UnpackTo): файлы, записанные
+# не позже N секунд назад, переносятся в выбранную папку (порядок: сначала Send, потом Receive).
+$script:ManualReceiveWindowSec = [int](Get-IniValue -Section "Settings" -Key "ManualReceiveWindowSec" -Default "300")
 $script:ClipRetryAttempts      = [int](Get-IniValue    -Section "Settings" -Key "ClipRetryAttempts" -Default "10")
 $script:ClipRetryDelayMs       = [int](Get-IniValue    -Section "Settings" -Key "ClipRetryDelayMs"  -Default "300")
 $script:RoutesEnabled          = Get-IniBool -Section "Settings" -Key "RoutesEnabled"          -Default $true
@@ -1234,6 +1237,82 @@ function Invoke-ClearDisk {
     }
 }
 
+# ===== РУЧНОЙ ПРИЁМ (UnpackTo): «СНАЧАЛА SEND, ПОТОМ RECEIVE» =====
+function Invoke-ManualReceive {
+    # Порядок работы «как раньше»: сначала Send на источнике, затем Receive File здесь.
+    # 1) Если чужой пакет ещё лежит в буфере (слушатель выключен или не успел обработать) -
+    #    принимаем его напрямую в выбранную папку.
+    # 2) Иначе слушатель уже принял файлы в InDir - переносим свежепринятые
+    #    (не старше ManualReceiveWindowSec секунд) из InDir в выбранную папку.
+    param(
+        [string]$TargetDir = $IN_DIR,
+        [switch]$NoRoutes
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+
+    if (-not (Test-Path -LiteralPath $TargetDir)) {
+        New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+    }
+
+    # --- Шаг 1: чужой пакет прямо в буфере ---
+    $packet = $null
+    try {
+        if ([System.Windows.Forms.Clipboard]::ContainsText()) {
+            $text = [System.Windows.Forms.Clipboard]::GetText()
+            if ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA)"') {
+                $origin = $env:COMPUTERNAME
+                if ($text -match '"Origin"\s*:\s*"([^"]+)"') { $origin = $matches[1] }
+                if ($origin -ne $env:COMPUTERNAME) { $packet = $text }
+            }
+        }
+    } catch {}
+
+    if ($packet) {
+        try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
+        Write-Log "Manual receive: incoming packet found in clipboard - receiving directly to '$TargetDir'" "Cyan"
+        return [bool](Unpack-Files -TargetDir $TargetDir -RawData $packet -NoRoutes:$NoRoutes)
+    }
+
+    # --- Шаг 2: слушатель уже принял файлы в InDir - переносим свежие ---
+    $cutoff = (Get-Date).AddSeconds(-$script:ManualReceiveWindowSec)
+    $recent = @(Get-ChildItem -Path $IN_DIR -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -ne '.part' -and $_.LastWriteTime -ge $cutoff })
+
+    if ($recent.Count -eq 0) {
+        Write-Log "Manual receive: clipboard has no incoming packet and no recent files in '$IN_DIR' (window $($script:ManualReceiveWindowSec) sec)" "Yellow"
+        $script:HasError = $true
+        return $false
+    }
+
+    # Целевая папка и есть InDir - файлы уже на месте.
+    if ([System.IO.Path]::GetFullPath($TargetDir) -ieq [System.IO.Path]::GetFullPath($IN_DIR)) {
+        Write-Log "Manual receive: $($recent.Count) recent file(s) already in '$IN_DIR' (target folder is InDir)" "Cyan"
+        return $true
+    }
+
+    Write-Log "Manual receive: moving $($recent.Count) recent file(s) from '$IN_DIR' to '$TargetDir'..." "Cyan"
+    $moved = 0
+    foreach ($f in $recent) {
+        $destPath = Join-Path $TargetDir $f.Name
+        try {
+            if (Test-Path -LiteralPath $destPath) { Remove-Item -LiteralPath $destPath -Force }
+            Move-Item -LiteralPath $f.FullName -Destination $destPath -Force
+            $moved++
+            Write-Log "  MOVED: $($f.Name)" "Gray"
+        } catch {
+            Write-Log "  FAIL: cannot move '$($f.Name)' - $($_.Exception.Message)" "Red"
+            $script:HasError = $true
+        }
+    }
+
+    if ($moved -gt 0) {
+        Write-Log "Manual receive: OK - $moved file(s) moved to '$TargetDir'" "Green"
+        [System.Media.SystemSounds]::Asterisk.Play()
+    }
+    return ($moved -gt 0)
+}
+
 # ===== РАЗБОР АРГУМЕНТОВ И ДИСПЕТЧЕР =====
 $Action = $null
 $Paths  = @()
@@ -1271,7 +1350,7 @@ elseif ($Action -eq "UnpackTo") {
         } else {
             $selectedPath
         }
-        [void](Unpack-Files -TargetDir $destination -NoRoutes:(-not $script:RoutesOverrideUnpackTo))
+        [void](Invoke-ManualReceive -TargetDir $destination -NoRoutes:(-not $script:RoutesOverrideUnpackTo))
     } else {
         Write-Log "ERROR: No target path given for UnpackTo!" "Red"
         $script:HasError = $true
