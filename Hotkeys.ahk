@@ -14,18 +14,22 @@
 ; ============================================================================
 
 ; ==================== БЛОК УВЕДОМЛЕНИЯ ПРИ ЗАПУСКЕ ====================
-MsgBox(
-    "Скрипт автоматизации запущен и готов к работе!`n`n" .
-    "Ctrl + Alt + A  —  Перезапуск скрипта (Reload)`n" .
-    "Ctrl + Alt + R  —  Исправить раскладку выделенного текста`n" .
-    "Pause           —  Исправить раскладку слова слева от курсора`n" .
-    "Ctrl + Alt + T  —  Вставить быструю ссылку КТалк`n" .
-    "Глобальные хоткеи для передачи файлов:`n" .
-    "Ctrl + Alt + C  —  Отправить все файлы из OUT`n" .
-    "Ctrl + Alt + V  —  Получить файлы в папку IN`n",
-    "AutoHotkey Домашний", 
-    "Iconi T5"
-)
+; Подсказка показывается только при обычном запуске; «-silent» в аргументах
+; отключает окно (для автозагрузки)
+if (A_ScriptArgs.Length = 0 || A_ScriptArgs[1] != "-silent") {
+    MsgBox(
+        "Скрипт автоматизации запущен и готов к работе!`n`n" .
+        "Ctrl + Alt + A  —  Перезапуск скрипта (Reload)`n" .
+        "Ctrl + Alt + R  —  Исправить раскладку выделенного текста`n" .
+        "Pause           —  Исправить раскладку слова слева от курсора`n" .
+        "Ctrl + Alt + T  —  Вставить быструю ссылку КТалк`n" .
+        "Глобальные хоткеи для передачи файлов:`n" .
+        "Ctrl + Alt + C  —  Отправить все файлы из OUT`n" .
+        "Ctrl + Alt + V  —  Получить файлы в папку IN`n",
+        "AutoHotkey Домашний", 
+        "Iconi T5"
+    )
+}
 
 ; ==================== ТАБЛИЦА И ЛОГИКА РАСКЛАДКИ ====================
 global ENG := "qwertyuiop[]asdfghjkl;'zxcvbnm,./``" . 'QWERTYUIOP{}ASDFGHJKL:"ZXCVBNM<>?~'
@@ -66,13 +70,27 @@ SwitchLayout(text) {
     global ENG2RUS, RUS2ENG
     dir := DetectDirection(text)
     if (dir = "none")
-        return text
+        return { text: text, direction: "none" }
     map := (dir = "eng2rus") ? ENG2RUS : RUS2ENG
     out := ""
     Loop Parse text {
         out .= map.Has(A_LoopField) ? map[A_LoopField] : A_LoopField
     }
     return { text: out, direction: dir }
+}
+
+GetQuickLink() {
+    ; Ссылка берётся из файла рядом со скриптом (ktalk_link.txt, первая строка);
+    ; так её можно менять без правки кода
+    path := A_ScriptDir . "\ktalk_link.txt"
+    if FileExist(path) {
+        f := FileOpen(path, "r")
+        first := Trim(f.ReadLine())
+        f.Close()
+        if (first != "")
+            return first
+    }
+    return "https://svo-airport.ktalk.ru/sirsb1vpb6fa"
 }
 
 SetKeyboardLayout(langId) {
@@ -93,7 +111,7 @@ SetKeyboardLayout(langId) {
 ; Ctrl + Alt + T (физическая sc014) — Вставить ссылку КТалк
 ^!sc014::
 {
-    A_Clipboard := "https://svo-airport.ktalk.ru/sirsb1vpb6fa"
+    A_Clipboard := GetQuickLink()
     Send("^v")
 }
 
@@ -108,7 +126,7 @@ SetKeyboardLayout(langId) {
     Send("^c")
     if ClipWait(0.6) {
         result := SwitchLayout(A_Clipboard)
-        if (result != A_Clipboard && IsObject(result)) {
+        if (result.direction != "none") {
             A_Clipboard := result.text
             Send("^v")
             Sleep(50)
@@ -159,7 +177,7 @@ Pause::
     Send("^c")
     if ClipWait(0.6) {
         result := SwitchLayout(A_Clipboard)
-        if IsObject(result) {
+        if (result.direction != "none") {
             A_Clipboard := result.text
             Send("^v")
             Sleep(50)

@@ -21,16 +21,28 @@
 #  Запуск: powershell -NoProfile -ExecutionPolicy Bypass -File CreateShortcuts.ps1
 # ===============================================================================
 
+param(
+    # Каталог установки (передаётся из Install.ps1). Если FileTransfer.ps1
+    # здесь не найден, берётся копия рядом с этим скриптом.
+    [string]$Destination = "C:\CHANGE"
+)
+
 $ErrorActionPreference = "Stop"
 
 $SendTo     = [Environment]::GetFolderPath('SendTo')
 $PowerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$ScriptPath = "C:\CHANGE\FileTransfer.ps1"
+$ScriptPath = Join-Path $Destination "FileTransfer.ps1"
 
 if (-not (Test-Path $PowerShell)) {
     Write-Host "ОШИБКА: не найден $PowerShell" -ForegroundColor Red
     pause
     exit 1
+}
+
+if (-not (Test-Path $ScriptPath)) {
+    # Фолбэк: скрипт лежит рядом с CreateShortcuts.ps1
+    $nearby = Join-Path $PSScriptRoot "FileTransfer.ps1"
+    if (Test-Path $nearby) { $ScriptPath = $nearby }
 }
 
 if (-not (Test-Path $ScriptPath)) {

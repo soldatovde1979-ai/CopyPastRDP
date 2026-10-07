@@ -32,7 +32,7 @@ param(
     [string]$Search = ""
 )
 
-$ErrorActionPreference = "SilentlyContinue"
+$ErrorActionPreference = "Continue"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 # ===== ПУТЬ К ЖУРНАЛУ =====
@@ -64,7 +64,8 @@ function Resolve-LogPath {
 function Read-LogLines {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    return @(Get-Content -LiteralPath $Path -Encoding UTF8)
+    try { return @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop) }
+    catch { return $null }
 }
 
 # ===== ВЫВОД С ПОДСВЕТКОЙ =====
@@ -181,12 +182,16 @@ function Show-Stats {
         Write-Host ("  " + $e.Name + ": " + $cnt)
     }
 
+    # Считаем MB только по строкам фактической отправки: строка «Sent ... to clipboard»
+    # (пакет мелких файлов) и «SYNC: Sending ...» (файл синхронизации). Строки
+    # «Packing/Processing» дублируют тот же объём и завышали сумму вдвое.
     $mb = 0.0
     foreach ($line in $Lines) {
+        if ($line -notmatch 'files to clipboard|SYNC: Sending') { continue }
         $m = [regex]::Match($line, '\(([\d.]+) MB\)')
         if ($m.Success) { $mb += [double]$m.Groups[1].Value }
     }
-    if ($mb -gt 0) { Write-Host ("  Передано данных (сумма по записям): " + [math]::Round($mb, 1) + " MB") }
+    if ($mb -gt 0) { Write-Host ("  Передано данных (отправлено): " + [math]::Round($mb, 1) + " MB") }
 
     $err = @($Lines | Where-Object { $_ -match "FATAL|ERROR|FAIL|WARNING" } | Select-Object -Last 5)
     if ($err.Count -gt 0) {

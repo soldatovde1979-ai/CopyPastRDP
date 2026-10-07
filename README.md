@@ -164,6 +164,17 @@
 
 Папки `C:\CHANGE\IN` и `C:\CHANGE\OUT` создаются автоматически. Журнал работы пишется в `C:\CHANGE\FileTransfer.log` (формат описан в [`SPEC.md`](SPEC.md)).
 
+### Подробность журнала (`-DebugLevel`)
+
+| Режим | Что пишется в журнал и консоль |
+|---|---|
+| `-DebugLevel 0` (по умолчанию) | Только ошибки (`FAIL`/`FATAL`/`ERROR`), предупреждения (`OVERWRITE`, ACK timeout) и **конечные статусы** операций копирования (`OK: Sent N files`, `SUCCESS: ... fully transferred`) |
+| `-DebugLevel 1` | Полный лог: каждый чанк, ожидание ACK, heartbeat `Watch alive`, trace-диагностика |
+
+Приоритет: аргумент `-DebugLevel` → ключ `Debug` в `setcp.ini` → `0`. Подробность
+`WatchTrace`/heartbeat имеет смысл только при `-DebugLevel 1` (при `0` строки
+диагностики не пишутся вовсе). Маркеры `===== START/END =====` пишутся всегда.
+
 ## 5. Настройка ([`setcp.ini`](setcp.ini))
 
 Все параметры скрипта вынесены в настроечный файл [`setcp.ini`](setcp.ini), который лежит
@@ -174,6 +185,7 @@
 
 ```ini
 [Settings]
+Debug=0                    ; 0 — только ошибки и конечные статусы; 1 — полный лог
 ChunkThresholdMB=10        ; порог включения чанкового режима, МБ
 ChunkSizeMB=5              ; размер одного чанка, МБ
 WarningSizeMB=15           ; предупреждение при большом пакете, МБ

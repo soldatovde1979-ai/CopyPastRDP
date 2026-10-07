@@ -25,11 +25,17 @@ function Write-Step([string]$Message, [string]$Color = "White") {
 }
 
 function Get-IniKey {
-    # Чтение значения ключа из INI-файла (секции игнорируются - ищется первое совпадение ключа)
-    param([string]$Path, [string]$Key, [string]$Default = "")
+    # Чтение значения ключа из INI-файла. Если задан $Section, совпадение
+    # ищется только внутри этой секции (по всему файлу ключи дублируются)
+    param([string]$Path, [string]$Key, [string]$Section = "", [string]$Default = "")
     if (-not (Test-Path -LiteralPath $Path)) { return $Default }
+    $current = ""
     foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
-        if ($line -match '^\s*' + [regex]::Escape($Key) + '\s*=\s*(.+?)\s*(?:;.*)?$') {
+        $t = $line.Trim()
+        if ($t -match '^\[(.+)\]$') { $current = $matches[1].Trim(); continue }
+        if ($t -eq "" -or $t.StartsWith(";") -or $t.StartsWith("#")) { continue }
+        if ($Section -and $current -ine $Section) { continue }
+        if ($t -match '^\s*' + [regex]::Escape($Key) + '\s*=\s*(.+?)\s*(?:;.*)?$') {
             return $matches[1].Trim()
         }
     }
@@ -136,11 +142,43 @@ if ($LocalSettings.Trim() -ne "") {
     Write-Step "Локальные настройки контура записаны в $localFile (в SyncDir не попадают)" "Green"
 }
 
+# ===== 3.3 Уникальный ID машины (MachineId) =====
+# Зашит в Origin пакетов и защищает механизм «свой-чужой» от совпадения
+# COMPUTERNAME на двух контурах. Хранится в setcp.local.ini (не синхронизируется).
+$localFile = Join-Path $Destination "setcp.local.ini"
+if (-not (Test-Path -LiteralPath $localFile)) {
+    Set-Content -LiteralPath $localFile -Encoding UTF8 -Value @(
+        "; setcp.local.ini - ЛОКАЛЬНЫЕ настройки ЭТОГО контура",
+        "[Settings]"
+    )
+}
+$machineId = Get-IniKey -Path $localFile -Key "MachineId" -Section "Settings"
+if (-not $machineId) {
+    $machineId = [guid]::NewGuid().ToString("N").Substring(0, 8)
+    $localLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @(Get-Content -LiteralPath $localFile -Encoding UTF8)) { $localLines.Add($line) }
+    $idx = -1
+    for ($i = 0; $i -lt $localLines.Count; $i++) {
+        if ($localLines[$i] -match '^\s*MachineId\s*=') { $idx = $i; break }
+    }
+    if ($idx -ge 0) { $localLines[$idx] = "MachineId=$machineId" }
+    else {
+        $sIdx = -1
+        for ($i = 0; $i -lt $localLines.Count; $i++) {
+            if ($localLines[$i] -match '^\s*\[Settings\]\s*$') { $sIdx = $i; break }
+        }
+        if ($sIdx -ge 0) { $localLines.Insert($sIdx + 1, "MachineId=$machineId") }
+        else { $localLines.Add("[Settings]"); $localLines.Add("MachineId=$machineId") }
+    }
+    Set-Content -LiteralPath $localFile -Value $localLines -Encoding UTF8
+    Write-Step "Присвоен MachineId=$machineId (setcp.local.ini)" "Green"
+}
+
 # ===== 4. Запуск создания ярлыков (если CreateShortcuts.ps1 рядом) =====
 $shortcutScript = Join-Path $PSScriptRoot "CreateShortcuts.ps1"
 if (Test-Path $shortcutScript -PathType Leaf) {
     Write-Step "Запускаю CreateShortcuts.ps1..." "Cyan"
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $shortcutScript
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $shortcutScript -Destination $Destination
 } else {
     Write-Step "ПРИМЕЧАНИЕ: CreateShortcuts.ps1 не найден рядом - ярлыки не создавались." "Yellow"
 }
@@ -182,7 +220,7 @@ try {
 # (иначе он посчитает только что скопированные файлы синхронизированными).
 Start-Sleep -Seconds 2
 
-$syncDir = Get-IniKey -Path $iniTarget -Key "SyncDir" -Default "C:\CHANGE\disk"
+$syncDir = Get-IniKey -Path $iniTarget -Key "SyncDir" -Section "Paths" -Default "C:\CHANGE\disk"
 $syncDir = [Environment]::ExpandEnvironmentVariables($syncDir)
 if ($syncDir.Length -gt 3) { $syncDir = $syncDir.TrimEnd('\', '/') }
 

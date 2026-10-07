@@ -17,7 +17,12 @@ param(
     [string[]]$Targets,
     [int]$ChunkThresholdMB = 10,
     [int]$ChunkSizeMB = 5,
-    [string]$Config = ""
+    [string]$Config = "",
+    # -DebugLevel 0 (по умолчанию) — только ошибки, предупреждения и конечные
+    # статусы операций копирования; -DebugLevel 1 — полный лог
+    # (каждый чанк, heartbeat, диагностика). Приоритет: аргумент -> INI -> 0.
+    # (имя DebugLevel, а не Debug: -Debug — встроенный общий параметр PowerShell)
+    [int]$DebugLevel = -1
 )
 
 # ===== ЗАГРУЗКА НАСТРОЕК ИЗ setcp.ini =====
@@ -33,18 +38,29 @@ $script:ConfigPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot "se
 $script:LocalConfigPath = Join-Path (Split-Path -Parent $script:ConfigPath) `
     ([System.IO.Path]::GetFileNameWithoutExtension($script:ConfigPath) + ".local" + [System.IO.Path]::GetExtension($script:ConfigPath))
 
+function Read-TextFile {
+    # Чтение текста файла: UTF-8 (с BOM или без); если декодирование дало
+    # replacement-символы (файл сохранён в ANSI/cp1251, например Блокнотом) —
+    # перечитываем в системной кодировке. Иначе русские маски в [Routes]
+    # превращаются в мусор и не совпадают никогда.
+    param([string]$Path)
+    $bytes  = [System.IO.File]::ReadAllBytes($Path)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    $text   = if ($hasBom) { [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3) }
+              else { [System.Text.Encoding]::UTF8.GetString($bytes) }
+    if ($text.Contains([string][char]0xFFFD)) {
+        $text = if ($hasBom) { [System.Text.Encoding]::Default.GetString($bytes, 3, $bytes.Length - 3) }
+                else { [System.Text.Encoding]::Default.GetString($bytes) }
+    }
+    return $text
+}
+
 function Get-IniContent {
     param([string]$Path)
     $ini = @{}
     if (-not (Test-Path $Path -PathType Leaf)) { return $ini }
 
-    # Чтение в UTF-8 независимо от наличия BOM (для корректных русских путей)
-    $bytes = [System.IO.File]::ReadAllBytes($Path)
-    $text  = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
-    } else {
-        [System.Text.Encoding]::UTF8.GetString($bytes)
-    }
+    $text = Read-TextFile -Path $Path
 
     $section = ""
     foreach ($raw in ($text -split "`r?`n")) {
@@ -119,6 +135,14 @@ $script:RoutesOverrideUnpackTo = Get-IniBool -Section "Settings" -Key "RoutesOve
 $script:DiskSyncEnabled   = Get-IniBool -Section "Settings" -Key "DiskSyncEnabled"   -Default $false
 $script:SyncPollMs        = [int](Get-IniValue -Section "Settings" -Key "SyncPollMs"        -Default "1000")
 $script:SyncAckTimeoutSec = [int](Get-IniValue -Section "Settings" -Key "SyncAckTimeoutSec" -Default "60")
+# Backoff после неудачной отправки (слушатель другого контура выключен): пауза
+# перед повтором растёт вдвое с каждой попыткой до SyncRetryMaxDelaySec.
+# Без этого файл ретраится каждым сканом, а буфер обмена постоянно забивается пакетами.
+$script:SyncRetryDelaySec    = [int](Get-IniValue -Section "Settings" -Key "SyncRetryDelaySec"    -Default "60")
+$script:SyncRetryMaxDelaySec = [int](Get-IniValue -Section "Settings" -Key "SyncRetryMaxDelaySec" -Default "1800")
+# Пакетная отправка: если в очереди синхронизации столько НОВЫХ элементов (файлов
+# + папок), они отправляются одним ZIP-архивом вместо тысяч отдельных пакетов.
+$script:SyncBatchFiles = [int](Get-IniValue -Section "Settings" -Key "SyncBatchFiles" -Default "50")
 $script:KeepAliveMinutes  = [int](Get-IniValue -Section "Settings" -Key "KeepAliveMinutes"  -Default "0")
 # Самообновление через папку синхронизации: принятые в SyncDir файлы
 # FileTransfer.ps1 / setcp.ini копируются в каталог скрипта и слушатель перезапускается.
@@ -127,6 +151,11 @@ $script:AutoUpdate = Get-IniBool -Section "Settings" -Key "AutoUpdate" -Default 
 # и подробный trace-режим с причинами каждого действия (0/1).
 $script:WatchHeartbeatSec = [int](Get-IniValue -Section "Settings" -Key "WatchHeartbeatSec" -Default "60")
 $script:WatchTrace        = Get-IniBool -Section "Settings" -Key "WatchTrace"        -Default $false
+
+# Режим журналирования: DebugLevel=0 — подробные строки (прогресс, диагностика)
+# не пишутся ни в журнал, ни в консоль; DebugLevel=1 — полный лог.
+if ($DebugLevel -lt 0) { $DebugLevel = [int](Get-IniValue -Section "Settings" -Key "Debug" -Default "0") }
+$script:DebugEnabled = ($DebugLevel -ne 0)
 
 # Рабочие каталоги и журнал
 $IN_DIR   = Get-IniPath -Section "Paths" -Key "InDir"   -Default "C:\CHANGE\IN"
@@ -138,15 +167,34 @@ $script:SyncDir = Get-IniPath -Section "Paths" -Key "SyncDir" -Default "C:\CHANG
 if ($script:SyncDir.Length -gt 3) { $script:SyncDir = $script:SyncDir.TrimEnd('\', '/') }
 
 # Маршрутизация приёма по маскам имён файлов (секция [Routes] файла setcp.ini)
-$script:Routes = @()
-if ($script:Ini.ContainsKey("Routes")) {
-    foreach ($mask in $script:Ini["Routes"].Keys) {
-        $target = [Environment]::ExpandEnvironmentVariables([string]$script:Ini["Routes"][$mask])
-        if (-not [string]::IsNullOrWhiteSpace($target)) {
-            $script:Routes += [pscustomobject]@{ Mask = $mask; Target = $target }
+function Update-Routes {
+    # Перечитывает [Routes] из setcp.ini (+ setcp.local.ini) на лету: правки
+    # маршрутов подхватываются приёмником БЕЗ перезапуска слушателя.
+    # Нужна из-за кириллицы и пробелов в масках: одна и та же секция читается
+    # каждый раз при приёме пакета, а не один раз при старте.
+    $merged = Get-IniContent -Path $script:ConfigPath
+    $local  = Get-IniContent -Path $script:LocalConfigPath
+    foreach ($sec in $local.Keys) {
+        if (-not $merged.ContainsKey($sec)) { $merged[$sec] = @{} }
+        foreach ($key in $local[$sec].Keys) { $merged[$sec][$key] = $local[$sec][$key] }
+    }
+    $script:Routes = @()
+    if ($merged.ContainsKey("Routes")) {
+        foreach ($mask in $merged["Routes"].Keys) {
+            $target = [Environment]::ExpandEnvironmentVariables([string]$merged["Routes"][$mask])
+            if (-not [string]::IsNullOrWhiteSpace($target)) {
+                $script:Routes += [pscustomobject]@{ Mask = $mask; Target = $target }
+            }
         }
     }
 }
+Update-Routes
+
+# Уникальный ID машины (MachineId из setcp.local.ini, создаётся Install.ps1):
+# зашит в Origin всех пакетов. Защищает механизм «свой-чужой» от совпадения
+# COMPUTERNAME на двух контурах (без ID пакеты молча игнорировались бы).
+$script:MachineId = Get-IniValue -Section "Settings" -Key "MachineId" -Default ""
+$script:OwnOrigin = if ($script:MachineId) { "$env:COMPUTERNAME@$script:MachineId" } else { $env:COMPUTERNAME }
 
 $script:HasError = $false
 
@@ -156,6 +204,10 @@ $script:RestartNeeded = $false
 
 # Занятые файлы SyncDir (для логирования только перехода состояния, без спама каждую секунду)
 $script:LastLocked = @{}
+
+# Backoff отправки: relpath -> @{ Key; Failures; NextAttempt }. Ключ — sync-ключ
+# объекта: изменился файл (новое содержимое) — счётчик неудач сбрасывается.
+$script:SendFailures = @{}
 
 # Персистентный журнал диска change.log (внутри SyncDir): ключ "relpath|длина|LastWriteTimeUtc"
 # -> тип записи (SNAPSHOT/SENT/RECEIVED/LOCKED). Заменяет in-memory-память: что отправлено
@@ -172,6 +224,12 @@ if ($script:DiskSyncEnabled -and -not (Test-Path $script:SyncDir)) {
 # ===== ЛОГИРОВАНИЕ =====
 function Write-Log {
     param([string]$Message, [string]$Color = "White")
+    # Debug=0: подробные строки (Gray/DarkGray/Cyan — прогресс, диагностика,
+    # heartbeat) не пишутся ни в консоль, ни в журнал. Остаются ошибки (Red),
+    # предупреждения (Yellow), конечные статусы (Green) и служебные (White/Magenta).
+    # Маркеры START/END пишутся всегда — по ним виден итог сеанса.
+    if (-not $script:DebugEnabled -and $Color -in @("Gray", "DarkGray", "Cyan") -and
+        $Message -notmatch '^===== (START|END)') { return }
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $label = if ($script:CurrentAction) { $script:CurrentAction } else { "SendFile" }
     try { Add-Content -Path $LOG_FILE -Value "[$timestamp] [$label] $Message" -Encoding UTF8 } catch {}
@@ -181,12 +239,117 @@ function Write-Log {
 function Rotate-Log {
     try {
         if (Test-Path $LOG_FILE) {
+            # Дешёвая проверка размера до чтения: heartbeat вызывает ротацию каждую минуту
+            $sizeGuard = [math]::Max($script:MaxLogLines * 64, 256KB)
+            if ((Get-Item $LOG_FILE -ErrorAction Stop).Length -lt $sizeGuard) { return }
             $lines = Get-Content $LOG_FILE -Encoding UTF8
             if ($lines.Count -gt $script:MaxLogLines) {
                 $lines | Select-Object -Last $script:MaxLogLines | Set-Content $LOG_FILE -Encoding UTF8
             }
         }
     } catch {}
+}
+
+# ===== ОБЩАЯ ЧАНКОВАЯ ОТПРАВКА (Pack и синхронизация) =====
+function Send-FileInChunks {
+    # Режет файл на чанки FILE_CHUNK_DATA и кладёт их в буфер, дожидаясь ACK
+    # после каждого. Единая реализация для ручной отправки (Pack/PackAuto)
+    # и синхронизации: правка протокола в одном месте.
+    # SyncMode: ACK с таймаутом и возвратом пакета (Wait-SyncAck);
+    # без SyncMode отправитель ждёт ACK бесконечно (как раньше в Pack).
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$RelPath = "",
+        [switch]$SyncMode
+    )
+
+    $chunkSizeBytes = $ChunkSizeMB * 1MB
+    $totalChunks = [math]::Ceiling($File.Length / $chunkSizeBytes)
+    if ($totalChunks -eq 0) { $totalChunks = 1 }
+    $fileGuid = [guid]::NewGuid().ToString("N")
+
+    # MD5 всего файла: приёмник сверяет собранный файл и отбраковывает битое
+    try { $fileHash = (Get-FileHash -LiteralPath $File.FullName -Algorithm MD5).Hash } catch { $fileHash = "" }
+
+    $savedClip = Save-ClipText
+    $stream = [System.IO.File]::OpenRead($File.FullName)
+    try {
+        $buffer = New-Object byte[] $chunkSizeBytes
+        $chunkIndex = 1
+
+        while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0 -or ($File.Length -eq 0 -and $chunkIndex -eq 1)) {
+            $actualBytes = if ($bytesRead -eq $chunkSizeBytes) { $buffer } else {
+                $slice = New-Object byte[] $bytesRead
+                [Array]::Copy($buffer, $slice, $bytesRead)
+                $slice
+            }
+
+            $payload = @{
+                Marker      = "FILE_CHUNK_DATA"
+                FileId      = $fileGuid
+                Name        = $File.Name
+                ChunkIndex  = $chunkIndex
+                TotalChunks = $totalChunks
+                Hash        = $fileHash
+                Content     = [Convert]::ToBase64String($actualBytes)
+                Origin      = $script:OwnOrigin
+            }
+            if ($RelPath) { $payload.RelPath = $RelPath }
+
+            $json = $payload | ConvertTo-Json -Compress
+
+            $clipOk = $false
+            $attempts = $script:ClipRetryAttempts
+            while ($attempts -gt 0 -and -not $clipOk) {
+                try {
+                    [System.Windows.Forms.Clipboard]::SetText($json)
+                    $clipOk = $true
+                } catch {
+                    $attempts--
+                    Start-Sleep -Milliseconds $script:ClipRetryDelayMs
+                }
+            }
+
+            if (-not $clipOk) {
+                Write-Log "FATAL: Cannot write chunk $chunkIndex/$totalChunks to clipboard!" "Red"
+                $script:HasError = $true
+                Restore-ClipText $savedClip
+                return $false
+            }
+
+            Write-Log "   -> Chunk $chunkIndex/$totalChunks sent. Waiting for ACK..." "Gray"
+
+            if ($SyncMode) {
+                if (-not (Wait-SyncAck -RelPath $RelPath)) { Restore-ClipText $savedClip; return $false }
+            } else {
+                # Ручная отправка: если приёмник не забрал чанк за SyncAckTimeoutSec —
+                # обрываем передачу (иначе отправка висела бы вечно). Файл НЕ удаляется.
+                $ackDeadline = (Get-Date).AddSeconds($script:SyncAckTimeoutSec)
+                $acked = $false
+                while ((Get-Date) -lt $ackDeadline) {
+                    Start-Sleep -Milliseconds $script:PollIntervalMs
+                    try {
+                        if (-not [System.Windows.Forms.Clipboard]::ContainsText()) { $acked = $true; break }
+                    } catch { $acked = $true; break }
+                }
+                if (-not $acked) {
+                    Write-Log "FATAL: receiver did not pick up chunk $chunkIndex/$totalChunks within $script:SyncAckTimeoutSec sec - transfer aborted, file kept. Is the listener running on the other side?" "Red"
+                    $script:HasError = $true
+                    Restore-ClipText $savedClip
+                    return $false
+                }
+            }
+
+            $chunkIndex++
+            if ($File.Length -eq 0) { break }
+        }
+    } finally {
+        $stream.Close()
+        $stream.Dispose()
+    }
+
+    Restore-ClipText $savedClip
+    return $true
 }
 
 # ===== УПАКОВКА И ОТПРАВКА =====
@@ -233,7 +396,7 @@ function Pack-Files {
             Files     = @()
             Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             Marker    = "FILE_TRANSFER_DATA"
-            Origin    = $env:COMPUTERNAME
+            Origin    = $script:OwnOrigin
         }
 
         $i = 0
@@ -242,7 +405,10 @@ function Pack-Files {
             Write-Log "  [$i/$($files.Count)] $($f.Name) ($([math]::Round($f.Length/1KB,1)) KB)" "Gray"
             try {
                 $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
-                $data.Files += @{ Name = $f.Name; Content = [Convert]::ToBase64String($bytes) }
+                # MD5 файла: приёмник сверяет и отбраковывает битое
+                $md5 = [System.Security.Cryptography.MD5]::Create()
+                try { $hash = [BitConverter]::ToString($md5.ComputeHash($bytes)).Replace('-', '') } finally { $md5.Dispose() }
+                $data.Files += @{ Name = $f.Name; Content = [Convert]::ToBase64String($bytes); Hash = $hash }
             } catch {
                 Write-Log "  FAIL: $($f.Name) - $($_.Exception.Message)" "Red"
                 $script:HasError = $true
@@ -251,6 +417,7 @@ function Pack-Files {
 
         $json = $data | ConvertTo-Json -Compress -Depth 10
 
+        $savedClip = Save-ClipText
         $clipOk = $false
         try {
             [System.Windows.Forms.Clipboard]::SetText($json)
@@ -275,14 +442,21 @@ function Pack-Files {
             # Ожидание для режима PackAuto (SEND FILE auto)
             if ($AutoWait) {
                 Write-Log "Waiting for receiver (WAITING FILE) to pick up the data..." "Cyan"
+                $ackDeadline = (Get-Date).AddSeconds($script:SyncAckTimeoutSec)
                 while ($true) {
                     Start-Sleep -Milliseconds $script:PollIntervalMs
                     try {
                         if (-not [System.Windows.Forms.Clipboard]::ContainsText()) {
                             Write-Log "SUCCESS: Receiver confirmed pick up!" "Green"
+                            # Пакет забран приёмником - возвращаем пользователю его текст буфера
+                            Restore-ClipText $savedClip
                             break
                         }
                     } catch {}
+                    if ((Get-Date) -gt $ackDeadline) {
+                        Write-Log "WARNING: receiver did not pick up the packet within $script:SyncAckTimeoutSec sec - data stays in the clipboard" "Yellow"
+                        break
+                    }
                 }
             }
         }
@@ -292,74 +466,10 @@ function Pack-Files {
         Write-Log "Chunk-mode: Packing $($files.Count) file(s) ($totalSizeMB MB) in $ChunkSizeMB MB chunks..." "Cyan"
 
         foreach ($file in $files) {
-            $chunkSizeBytes = $ChunkSizeMB * 1MB
-            $totalChunks = [math]::Ceiling($file.Length / $chunkSizeBytes)
-            if ($totalChunks -eq 0) { $totalChunks = 1 }
-            $fileGuid = [guid]::NewGuid().ToString("N")
-
-            Write-Log "  Processing '$($file.Name)' ($([math]::Round($file.Length/1MB,2)) MB) in $totalChunks chunk(s)..." "Gray"
-
-            $stream = [System.IO.File]::OpenRead($file.FullName)
-            try {
-                $buffer = New-Object byte[] $chunkSizeBytes
-                $chunkIndex = 1
-
-                while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0 -or ($file.Length -eq 0 -and $chunkIndex -eq 1)) {
-                    $actualBytes = if ($bytesRead -eq $chunkSizeBytes) { $buffer } else {
-                        $slice = New-Object byte[] $bytesRead
-                        [Array]::Copy($buffer, $slice, $bytesRead)
-                        $slice
-                    }
-
-                    $payload = @{
-                        Marker      = "FILE_CHUNK_DATA"
-                        FileId      = $fileGuid
-                        Name        = $file.Name
-                        ChunkIndex  = $chunkIndex
-                        TotalChunks = $totalChunks
-                        Content     = [Convert]::ToBase64String($actualBytes)
-                        Origin      = $env:COMPUTERNAME
-                    }
-
-                    $json = $payload | ConvertTo-Json -Compress
-
-                    $clipOk = $false
-                    $attempts = $script:ClipRetryAttempts
-                    while ($attempts -gt 0 -and -not $clipOk) {
-                        try {
-                            [System.Windows.Forms.Clipboard]::SetText($json)
-                            $clipOk = $true
-                        } catch {
-                            $attempts--
-                            Start-Sleep -Milliseconds $script:ClipRetryDelayMs
-                        }
-                    }
-
-                    if (-not $clipOk) {
-                        Write-Log "FATAL: Cannot write chunk $chunkIndex/$totalChunks to clipboard!" "Red"
-                        $script:HasError = $true
-                        return
-                    }
-
-                    Write-Log "   -> Chunk $chunkIndex/$totalChunks sent. Waiting for ACK..." "Gray"
-
-                    while ($true) {
-                        Start-Sleep -Milliseconds $script:PollIntervalMs
-                        try {
-                            if (-not [System.Windows.Forms.Clipboard]::ContainsText()) { break }
-                        } catch {}
-                    }
-
-                    $chunkIndex++
-                    if ($file.Length -eq 0) { break }
-                }
-            } finally {
-                $stream.Close()
-                $stream.Dispose()
+            if (Send-FileInChunks -File $file) {
+                if ($file.Directory.FullName -ieq $OUT_DIR) { Remove-Item $file.FullName -Force }
+                Write-Log "SUCCESS: '$($file.Name)' fully transferred!" "Green"
             }
-
-            if ($file.Directory.FullName -ieq $OUT_DIR) { Remove-Item $file.FullName -Force }
-            Write-Log "SUCCESS: '$($file.Name)' fully transferred!" "Green"
         }
         [System.Media.SystemSounds]::Asterisk.Play()
     }
@@ -401,6 +511,10 @@ function Unpack-Files {
         [switch]$NoRoutes
     )
 
+    # Маршруты перечитываются на лету: правки [Routes] в setcp.ini
+    # подхватываются приёмником без перезапуска слушателя.
+    Update-Routes
+
     $clipData = $RawData
     if (-not $clipData) {
         try {
@@ -409,9 +523,9 @@ function Unpack-Files {
                 $clipData = [System.Windows.Forms.Clipboard]::GetText()
             }
         } catch {
-            $clipData = Get-Clipboard -Raw
+            # Фолбэк без дублирования: Get-Clipboard -Raw возвращает текст целиком
+            try { $clipData = Get-Clipboard -Raw } catch {}
         }
-        if (-not $clipData) { $clipData = Get-Clipboard }
     }
 
     if (-not $clipData) {
@@ -450,7 +564,22 @@ function Unpack-Files {
 
                 if (Test-Path $outPath) { Write-Log "  OVERWRITE: $safeName" "Yellow" }
 
-                [System.IO.File]::WriteAllBytes($outPath, [Convert]::FromBase64String($item.Content))
+                $bytes = [Convert]::FromBase64String($item.Content)
+
+                # Сверка MD5, если отправитель передал хеш: битый файл не сохраняется
+                $itemHash = $null
+                if ($item.PSObject.Properties['Hash']) { $itemHash = [string]$item.Hash }
+                if ($itemHash) {
+                    $md5 = [System.Security.Cryptography.MD5]::Create()
+                    try { $gotHash = [BitConverter]::ToString($md5.ComputeHash($bytes)).Replace('-', '') } finally { $md5.Dispose() }
+                    if ($gotHash -ne $itemHash) {
+                        Write-Log "  FAIL: $safeName - MD5 mismatch ($gotHash <> $itemHash)" "Red"
+                        $script:HasError = $true
+                        continue
+                    }
+                }
+
+                [System.IO.File]::WriteAllBytes($outPath, $bytes)
                 Write-Log "  OK: $safeName" "Gray"
             } catch {
                 Write-Log "  FAIL: $($item.Name) - $($_.Exception.Message)" "Red"
@@ -486,7 +615,8 @@ function Unpack-Files {
             $routeMask  = $null
             # Маркер удаления .del маршрутизации не подлежит: он всегда
             # сохраняется в КОРЕНЬ SyncDir, иначе очистка на этом контуре не сработает.
-            if ($script:RoutesEnabled -and $syncRel -ne '.del') {
+            # .synczip (пакетный архив) — тоже строго в корень.
+            if ($script:RoutesEnabled -and $syncRel -ne '.del' -and $syncRel -notmatch '\.synczip$') {
                 foreach ($route in $script:Routes) {
                     if ($safeName -like $route.Mask) {
                         $syncTarget = $route.Target
@@ -516,6 +646,13 @@ function Unpack-Files {
         if ($data.ChunkIndex -eq 1 -and (Test-Path $partPath)) {
             Remove-Item $partPath -Force
         }
+        if ($data.ChunkIndex -gt 1 -and -not (Test-Path $partPath)) {
+            # Пропущен чанк 1 (не дошёл/не собран) - дописывать некуда,
+            # передача начнётся заново со следующего скана/попытки
+            Write-Log "FAIL: chunk $($data.ChunkIndex) for '$safeName' but '.part' is missing - transfer restarts" "Red"
+            $script:HasError = $true
+            return $false
+        }
 
         $bytes = [Convert]::FromBase64String($data.Content)
         $outStream = New-Object System.IO.FileStream($partPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -531,7 +668,29 @@ function Unpack-Files {
         if ($data.ChunkIndex -eq $data.TotalChunks) {
             if (Test-Path $finalPath) { Remove-Item $finalPath -Force }
             Move-Item $partPath $finalPath -Force
+
+            # Контроль целостности: MD5 собранного файла против хеша из пакета.
+            # Битая сборка удаляется - отправитель перешлёт файл целиком.
+            $expectHash = $null
+            if ($data.PSObject.Properties['Hash']) { $expectHash = [string]$data.Hash }
+            if ($expectHash) {
+                $gotHash = (Get-FileHash -LiteralPath $finalPath -Algorithm MD5 -ErrorAction SilentlyContinue).Hash
+                if ($gotHash -and ($gotHash -ne $expectHash)) {
+                    Write-Log "FAIL: MD5 mismatch for '$safeName' ($gotHash <> $expectHash) - file deleted, will be resent" "Red"
+                    Remove-Item $finalPath -Force -ErrorAction SilentlyContinue
+                    $script:HasError = $true
+                    return $false
+                }
+            }
+
             if ($syncRel) {
+                # Пакетный архив: распаковываем в SyncDir вместо обычного сохранения
+                if ($syncRel -match '\.synczip$') {
+                    Write-Log "SUCCESS: batch archive '$safeName' received" "Green"
+                    [void](Expand-SyncBatch -ZipPath $finalPath)
+                    [System.Media.SystemSounds]::Asterisk.Play()
+                    return $true
+                }
                 # Помечаем принятый файл как обработанный, чтобы не отправить его обратно (петля)
                 $item = Get-Item $finalPath -ErrorAction SilentlyContinue
                 if ($item) { Add-ChangeEntry -Type "RECEIVED" -RelPath $syncRel -Item $item }
@@ -540,13 +699,27 @@ function Unpack-Files {
                 # Самообновление: файлы FileTransfer.ps1 / setcp.ini, пришедшие в корень SyncDir,
                 # применяются в каталог запущенного скрипта, после чего слушатель перезапускается.
                 if ($script:AutoUpdate -and $syncRel -notmatch '/' -and $safeName -in @('FileTransfer.ps1', 'setcp.ini')) {
-                    $rootDir = Split-Path -Parent $PSCommandPath
-                    try {
-                        Copy-Item -Path $finalPath -Destination (Join-Path $rootDir $safeName) -Force
-                        Write-Log "AUTOUPDATE: '$safeName' applied to $rootDir - listener will restart" "Cyan"
-                        $script:RestartNeeded = $true
-                    } catch {
-                        Write-Log "AUTOUPDATE: FAILED to apply '$safeName' - $($_.Exception.Message)" "Red"
+                    # .ps1 перед применением проверяется синтаксически: битое
+                    # обновление (обрыв передачи) убил бы слушателя на обоих контурах
+                    $apply = $true
+                    if ($safeName -eq 'FileTransfer.ps1') {
+                        $perrs = $null
+                        [void][System.Management.Automation.Language.Parser]::ParseFile($finalPath, [ref]$null, [ref]$perrs)
+                        if ($perrs -and $perrs.Count -gt 0) {
+                            Write-Log "AUTOUPDATE: '$safeName' FAILED syntax check ($($perrs[0].Message)) - update rejected" "Red"
+                            Remove-Item $finalPath -Force -ErrorAction SilentlyContinue
+                            $apply = $false
+                        }
+                    }
+                    if ($apply) {
+                        $rootDir = Split-Path -Parent $PSCommandPath
+                        try {
+                            Copy-Item -Path $finalPath -Destination (Join-Path $rootDir $safeName) -Force
+                            Write-Log "AUTOUPDATE: '$safeName' applied to $rootDir - listener will restart" "Cyan"
+                            $script:RestartNeeded = $true
+                        } catch {
+                            Write-Log "AUTOUPDATE: FAILED to apply '$safeName' - $($_.Exception.Message)" "Red"
+                        }
                     }
                 }
             } else {
@@ -638,6 +811,11 @@ function Initialize-ChangeLog {
                 Add-ChangeEntry -Type "SNAPSHOT" -RelPath (Get-RelPath -FullName $_.FullName) -Item $_
                 $count++
             }
+        Get-ChildItem -Path $script:SyncDir -Directory -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Add-DirChangeEntry -Type "SNAPSHOT" -RelPath (Get-RelPath -FullName $_.FullName)
+                $count++
+            }
         Write-Log "SYNC: change.log created/rotated, $count file(s) marked as snapshot." "DarkGray"
     } elseif ($loaded -gt 0) {
         Write-Log "SYNC: change.log loaded ($loaded records)." "DarkGray"
@@ -666,78 +844,206 @@ function Wait-SyncAck {
     }
 }
 
+function Save-ClipText {
+    # Текст буфера перед отправкой пакета, чтобы вернуть его после попытки:
+    # пользователь не должен находить в буфере JSON вместо своего текста.
+    # (Только текст; скопированный в проводнике список файлов не сохраняем.)
+    try {
+        if ([System.Windows.Forms.Clipboard]::ContainsText()) { return [System.Windows.Forms.Clipboard]::GetText() }
+    } catch {}
+    return $null
+}
+
+function Restore-ClipText {
+    # Возврат пользовательского текста в буфер после отправки/неудачи.
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return }
+    try { [System.Windows.Forms.Clipboard]::SetText($Text) } catch {}
+}
+
+function Test-SyncRetryReady {
+    # True, если отправку можно повторять: неудач не было, изменился объект
+    # (новый sync-ключ) или истёк срок backoff после прошлой неудачи.
+    param([string]$RelPath, [string]$SyncKey)
+    $rec = $script:SendFailures[$RelPath]
+    if (-not $rec) { return $true }
+    if ($rec.Key -ne $SyncKey) { return $true }
+    return ((Get-Date) -ge $rec.NextAttempt)
+}
+
+function Register-SyncFailure {
+    # Неудачная отправка: увеличиваем счётчик и откладываем повтор (backoff),
+    # чтобы не забивать буфер обмена повторами каждое сканирование.
+    param([string]$RelPath, [string]$SyncKey)
+    $rec = $script:SendFailures[$RelPath]
+    if (-not $rec -or $rec.Key -ne $SyncKey) { $rec = @{ Key = $SyncKey; Failures = 0 } }
+    $rec.Failures++
+    $delay = [math]::Min($script:SyncRetryDelaySec * [math]::Pow(2, $rec.Failures - 1), $script:SyncRetryMaxDelaySec)
+    $rec.NextAttempt = (Get-Date).AddSeconds($delay)
+    $script:SendFailures[$RelPath] = $rec
+    Write-Log "SYNC: '$RelPath' next attempt in $([int]$delay) sec (failure #$($rec.Failures))" "DarkGray"
+}
+
+function Clear-SyncFailure {
+    param([string]$RelPath)
+    $script:SendFailures.Remove($RelPath) | Out-Null
+}
+
+function Get-DirKey {
+    # Стабильный ключ папки для change.log: не зависит от времени изменения
+    # папки (оно меняется при любом изменении содержимого).
+    param([string]$RelPath)
+    $relNorm = ($RelPath -replace '\\', '/').ToLowerInvariant()
+    return "dir/$relNorm|0|0"
+}
+
+function Add-DirChangeEntry {
+    # Запись о папке в change.log (тип SENT/RECEIVED/SNAPSHOT).
+    param([string]$Type, [string]$RelPath)
+    $key = Get-DirKey -RelPath $RelPath
+    $script:ChangeLog[$key] = $Type
+    if (-not $script:ChangeLogPath) { return }
+    $relNorm = ($RelPath -replace '\\', '/').ToLowerInvariant()
+    $line = "{0}|{1}|{2}|{3}|{4}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Type, "dir/$relNorm", 0, 0
+    try { Add-Content -LiteralPath $script:ChangeLogPath -Value $line -Encoding UTF8 } catch {}
+}
+
 function Send-SyncFile {
-    # Отправка файла из SyncDir ЧАНКАМИ (существующим механизмом FILE_CHUNK_DATA)
-    # на такой же относительный путь (RelPath) в другом контуре.
+    # Отправка файла из SyncDir чанками на тот же относительный путь (RelPath)
+    # в другом контуре. Общая чанковая логика - в Send-FileInChunks.
     param(
         [System.IO.FileInfo]$File,
         [string]$RelPath
     )
 
-    $chunkSizeBytes = $ChunkSizeMB * 1MB
-    $totalChunks = [math]::Ceiling($File.Length / $chunkSizeBytes)
-    if ($totalChunks -eq 0) { $totalChunks = 1 }
-    $fileGuid = [guid]::NewGuid().ToString("N")
+    Write-Log "SYNC: Sending '$RelPath' ($([math]::Round($File.Length/1MB,2)) MB)..." "Cyan"
 
-    Write-Log "SYNC: Sending '$RelPath' ($([math]::Round($File.Length/1MB,2)) MB) in $totalChunks chunk(s)..." "Cyan"
-
-    $stream = [System.IO.File]::Open($File.FullName, 'Open', 'Read', 'ReadWrite')
-    try {
-        $buffer = New-Object byte[] $chunkSizeBytes
-        $chunkIndex = 1
-
-        while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0 -or ($File.Length -eq 0 -and $chunkIndex -eq 1)) {
-            $actualBytes = if ($bytesRead -eq $chunkSizeBytes) { $buffer } else {
-                $slice = New-Object byte[] $bytesRead
-                [Array]::Copy($buffer, $slice, $bytesRead)
-                $slice
-            }
-
-            $payload = @{
-                Marker      = "FILE_CHUNK_DATA"
-                FileId      = $fileGuid
-                Name        = $File.Name
-                RelPath     = $RelPath
-                ChunkIndex  = $chunkIndex
-                TotalChunks = $totalChunks
-                Content     = [Convert]::ToBase64String($actualBytes)
-                Origin      = $env:COMPUTERNAME
-            }
-
-            $json = $payload | ConvertTo-Json -Compress
-
-            $clipOk = $false
-            $attempts = $script:ClipRetryAttempts
-            while ($attempts -gt 0 -and -not $clipOk) {
-                try {
-                    [System.Windows.Forms.Clipboard]::SetText($json)
-                    $clipOk = $true
-                } catch {
-                    $attempts--
-                    Start-Sleep -Milliseconds $script:ClipRetryDelayMs
-                }
-            }
-
-            if (-not $clipOk) {
-                Write-Log "SYNC: FATAL: cannot write chunk $chunkIndex/$totalChunks of '$RelPath' to clipboard!" "Red"
-                $script:HasError = $true
-                return $false
-            }
-
-            Write-Log "SYNC:   chunk $chunkIndex/$totalChunks sent. Waiting for ACK..." "Gray"
-
-            if (-not (Wait-SyncAck -RelPath $RelPath)) { return $false }
-
-            $chunkIndex++
-            if ($File.Length -eq 0) { break }
-        }
-    } finally {
-        $stream.Close()
-        $stream.Dispose()
+    if (-not (Send-FileInChunks -File $File -RelPath $RelPath -SyncMode)) {
+        return $false
     }
 
     Write-Log "SYNC: '$RelPath' fully transferred!" "Green"
     return $true
+}
+
+function Send-SyncDirectory {
+    # Отправка пакета FILE_DISK_DIR: создание ПАПКИ по RelPath на другом контуре.
+    # Файлы создают папки на приёме сами (по RelPath), пустые папки — никто.
+    param([string]$RelPath)
+
+    $payload = @{
+        Marker  = "FILE_DISK_DIR"
+        RelPath = $RelPath
+        Origin  = $script:OwnOrigin
+    }
+    $json = $payload | ConvertTo-Json -Compress
+
+    $savedClip = Save-ClipText
+    $clipOk = $false
+    $attempts = $script:ClipRetryAttempts
+    while ($attempts -gt 0 -and -not $clipOk) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($json)
+            $clipOk = $true
+        } catch {
+            $attempts--
+            Start-Sleep -Milliseconds $script:ClipRetryDelayMs
+        }
+    }
+    if (-not $clipOk) {
+        Write-Log "SYNC: FATAL: cannot write folder packet '$RelPath' to clipboard!" "Red"
+        return $false
+    }
+    if (-not (Wait-SyncAck -RelPath $RelPath)) { Restore-ClipText $savedClip; return $false }
+    Restore-ClipText $savedClip
+    Write-Log "SYNC: folder '$RelPath' transferred!" "Green"
+    return $true
+}
+
+function New-SyncBatchZip {
+    # Упаковывает очередь синхронизации в один архив: файлы с относительными
+    # путями + манифест _syncdirs.txt со списком папок (Expand в PS 5.1 может
+    # не создавать пустые папки — создаём их по манифесту). Возвращает путь.
+    param([object[]]$Files, [string[]]$DirRelPaths)
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zipPath = Join-Path $script:SyncDir ".syncbatch.synczip"
+    try {
+        $fs = [System.IO.File]::Open($zipPath, 'Create')
+        $zip = New-Object System.IO.Compression.ZipArchive($fs, 'Create', $false, [System.Text.Encoding]::UTF8)
+        try {
+            foreach ($pf in $Files) {
+                $rel = Get-RelPath -FullName $pf.File.FullName
+                $entry = $zip.CreateEntry($rel, [System.IO.Compression.CompressionLevel]::Optimal)
+                $es = $entry.Open()
+                try {
+                    $src = [System.IO.File]::OpenRead($pf.File.FullName)
+                    try { $src.CopyTo($es) } finally { $src.Close(); $src.Dispose() }
+                } finally { $es.Close(); $es.Dispose() }
+            }
+            # Пустые папки — записями-каталогами и манифестом на всякий случай
+            $dirsLine = ($DirRelPaths -join "`r`n")
+            $entry = $zip.CreateEntry("_syncdirs.txt", [System.IO.Compression.CompressionLevel]::Optimal)
+            $es = $entry.Open()
+            $w = New-Object System.IO.StreamWriter($es)
+            $w.Write($dirsLine)
+            $w.Flush(); $w.Close()
+        } finally { $zip.Dispose(); $fs.Close(); $fs.Dispose() }
+    } catch {
+        Write-Log "SYNC: cannot build batch zip - $($_.Exception.Message)" "Red"
+        return $null
+    }
+    return $zipPath
+}
+
+function Expand-SyncBatch {
+    # Приём пакетного архива: распаковка в SyncDir, пометка содержимого RECEIVED,
+    # создание папок из манифеста, удаление архива.
+    param([string]$ZipPath)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    try {
+        $zip = [System.IO.Compression.ZipFile]::Open($ZipPath, 'Read', [System.Text.Encoding]::UTF8)
+        try {
+            foreach ($entry in $zip.Entries) {
+                $rel = ($entry.FullName -replace '\\', '/').TrimEnd('/')
+                if (-not $rel -or $rel -eq '_syncdirs.txt') { continue }
+                $target = Join-Path $script:SyncDir ($rel -replace '/', '\')
+                if ($entry.FullName.EndsWith('/')) {
+                    if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+                    Add-DirChangeEntry -Type "RECEIVED" -RelPath $rel
+                    continue
+                }
+                $dirPart = Split-Path -Parent $target
+                if ($dirPart -and -not (Test-Path -LiteralPath $dirPart)) { New-Item -ItemType Directory -Path $dirPart -Force | Out-Null }
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+                $item = Get-Item -LiteralPath $target
+                Add-ChangeEntry -Type "RECEIVED" -RelPath $rel -Item $item
+            }
+            # Манифест папок: создаём и помечаем RECEIVED всё перечисленное
+            $dirsEntry = $zip.Entries | Where-Object { $_.FullName -eq '_syncdirs.txt' }
+            if ($dirsEntry) {
+                $sr = New-Object System.IO.StreamReader($dirsEntry.Open(), [System.Text.Encoding]::UTF8)
+                $content = $sr.ReadToEnd()
+                $sr.Close()
+                foreach ($line in ($content -split "`r?`n")) {
+                    $d = $line.Trim()
+                    if (-not $d) { continue }
+                    $target = Join-Path $script:SyncDir ($d -replace '/', '\')
+                    if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+                    Add-DirChangeEntry -Type "RECEIVED" -RelPath $d
+                }
+            }
+        } finally { $zip.Dispose() }
+        Remove-Item -LiteralPath $ZipPath -Force
+        Write-Log "SYNC: batch archive expanded into SyncDir" "Green"
+        return $true
+    } catch {
+        Write-Log "SYNC: FAILED to expand batch archive - $($_.Exception.Message)" "Red"
+        $script:HasError = $true
+        return $false
+    }
 }
 
 function Scan-SyncDir {
@@ -764,14 +1070,18 @@ function Scan-SyncDir {
             $markerHandled = $script:ChangeLog.ContainsKey($markerKey) -and $script:ChangeLog[$markerKey] -in @('SENT', 'RECEIVED')
             if (-not $markerHandled) {
                 # Маркер ещё не ушёл на другой контур - отправляем его как обычный файл.
-                if (Test-FileFree -Path $delMarkerPath) {
+                # Backoff: после неудачи повтор откладывается, буфер не забивается повторами.
+                $retryReady = Test-SyncRetryReady -RelPath ".del" -SyncKey $markerKey
+                if ($retryReady -and (Test-FileFree -Path $delMarkerPath)) {
                     if (Send-SyncFile -File $markerItem -RelPath ".del") {
+                        Clear-SyncFailure -RelPath ".del"
                         Add-ChangeEntry -Type "SENT" -RelPath ".del" -Item $markerItem
                         $markerHandled = $true
                     } else {
-                        Write-Log "DEL-MARKER: '.del' not sent yet (remote listener is down?) - will retry on next scan" "Yellow"
+                        Register-SyncFailure -RelPath ".del" -SyncKey $markerKey
+                        Write-Log "DEL-MARKER: '.del' not sent (remote listener is down?) - will retry later" "Yellow"
                     }
-                } else {
+                } elseif ($retryReady) {
                     Write-Log "DEL-MARKER: '.del' is locked (still being written) - will retry" "DarkGray"
                 }
             }
@@ -786,10 +1096,69 @@ function Scan-SyncDir {
         }
     }
 
-    # Служебные файлы не отправляются: сам журнал change.log, маркер удаления .del
-    # (обрабатывается отдельно выше) и незавершённые сборки .part
+    # Служебные файлы не отправляются: сам журнал change.log, маркер удаления .del,
+    # незавершённые сборки .part и пакетные архивы .synczip (отправляются отдельно)
     $files       = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ine 'change.log' -and $_.Name -ine '.del' -and $_.Extension -ne '.part' })
+        Where-Object { $_.Name -ine 'change.log' -and $_.Name -ine '.del' -and $_.Extension -ne '.part' -and $_.Extension -ne '.synczip' })
+
+    # Папки и файлы к отправке (сначала сбор_pending, затем решение: batch или по одному)
+    $dirs = @(Get-ChildItem -Path $script:SyncDir -Directory -Recurse -ErrorAction SilentlyContinue)
+
+    # === Пакетный режим: много нового — всё в один ZIP вместо сотен пакетов ===
+    $pendingDirs  = @()
+    foreach ($dir in $dirs) {
+        $rel = Get-RelPath -FullName $dir.FullName
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $dirKey = Get-DirKey -RelPath $rel
+        if ($script:ChangeLog.ContainsKey($dirKey)) { continue }
+        $pendingDirs += $rel
+    }
+    $pendingFiles = @()
+    foreach ($file in $files) {
+        $rel = Get-RelPath -FullName $file.FullName
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $key = Get-SyncKey -Item $file -RelPath $rel
+        if ($script:ChangeLog.ContainsKey($key) -and $script:ChangeLog[$key] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { continue }
+        if (-not (Test-FileFree -Path $file.FullName)) { continue }   # занятые — в следующий скан
+        $pendingFiles += [pscustomobject]@{ File = $file; Rel = $rel; Key = $key }
+    }
+    if (($pendingDirs.Count + $pendingFiles.Count) -ge $script:SyncBatchFiles) {
+        Write-Log "SYNC: batch mode: $($pendingFiles.Count) file(s) + $($pendingDirs.Count) folder(s) -> single zip" "Cyan"
+        $zipPath = New-SyncBatchZip -Files $pendingFiles -DirRelPaths $pendingDirs
+        if ($zipPath) {
+            $zipItem = Get-Item $zipPath
+            if (Send-SyncFile -File $zipItem -RelPath (Split-Path $zipPath -Leaf)) {
+                Clear-SyncFailure -RelPath ".syncbatch"
+                # Содержимое помечаем SENT (архив доставлен), сам архив удаляем
+                foreach ($d in $pendingDirs) { Add-DirChangeEntry -Type "SENT" -RelPath $d }
+                foreach ($pf in $pendingFiles) { Add-ChangeEntry -Type "SENT" -RelPath $pf.Rel -Item $pf.File }
+                Remove-Item -LiteralPath $zipPath -Force
+                Write-Log "SYNC: batch sent - $($pendingFiles.Count) file(s), $($pendingDirs.Count) folder(s) in one archive" "Green"
+            } else {
+                # Фиксированный ключ backoff: при недоступности приёмника — одна попытка в окно
+                Register-SyncFailure -RelPath ".syncbatch" -SyncKey "batch"
+                Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+                Write-Log "SYNC: batch NOT sent - will retry later (single attempt per backoff window)" "Yellow"
+            }
+        }
+        return   # пакетный скан обрабатывает всю очередь — персональные отправки не нужны
+    }
+
+    # Одиночный режим (очередь мала): как раньше — папки и файлы по одному
+    foreach ($dir in $dirs) {
+        $rel = Get-RelPath -FullName $dir.FullName
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $dirKey = Get-DirKey -RelPath $rel
+        if ($script:ChangeLog.ContainsKey($dirKey)) { continue }
+        if (-not (Test-SyncRetryReady -RelPath "dir:$rel" -SyncKey $dirKey)) { continue }
+        if (Send-SyncDirectory -RelPath $rel) {
+            Clear-SyncFailure -RelPath "dir:$rel"
+            Add-DirChangeEntry -Type "SENT" -RelPath $rel
+        } else {
+            Register-SyncFailure -RelPath "dir:$rel" -SyncKey $dirKey
+        }
+    }
+
     $newCount    = 0
     $handledCount = 0
     $lockedCount = 0
@@ -816,12 +1185,14 @@ function Scan-SyncDir {
             continue
         }
         $script:LastLocked.Remove($key)
+        if (-not (Test-SyncRetryReady -RelPath $rel -SyncKey $key)) { continue }
         if (Send-SyncFile -File $file -RelPath $rel) {
+            Clear-SyncFailure -RelPath $rel
             Add-ChangeEntry -Type "SENT" -RelPath $rel -Item $file
             $sentCount++
         } else {
             $failedCount++
-            Write-Log "SYNC: '$rel' NOT sent - will retry on next scan" "Yellow"
+            Register-SyncFailure -RelPath $rel -SyncKey $key
         }
     }
     if ($script:WatchTrace -and $files.Count -gt 0) {
@@ -867,8 +1238,9 @@ function Restart-Listener {
 function Stop-OldListeners {
     # При старте Watch завершаем другие работающие экземпляры слушателя (кроме себя),
     # чтобы несколько процессов не конкурировали за буфер обмена.
-    $old = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*FileTransfer.ps1*Watch*" })
+    $old = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and
+                       $_.CommandLine -like "*FileTransfer.ps1*" -and $_.CommandLine -match '\bWatch\b' })
     foreach ($proc in $old) {
         try {
             Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
@@ -914,11 +1286,11 @@ function Watch-Clipboard {
                 $text = [System.Windows.Forms.Clipboard]::GetText()
                 if ([string]::IsNullOrWhiteSpace($text)) {
                     $clipState = "empty"
-                } elseif ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA|FILE_DISK_CMD)"') {
+                } elseif ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA|FILE_DISK_CMD|FILE_DISK_DIR)"') {
 
                     # Свой-чужой: пакет с Origin = имя этого же ПК положен локально этим же скриптом.
                     # Он предназначен для Watch на ДРУГОМ конце RDP - не трогаем буфер, ждём его.
-                    if ($text -match '"Origin"\s*:\s*"([^"]+)"' -and $matches[1] -eq $env:COMPUTERNAME) {
+                    if ($text -match '"Origin"\s*:\s*"([^"]+)"' -and $matches[1] -eq $script:OwnOrigin) {
                         $clipState = "own-packet"
                         $skipScan  = $true
                     } else {
@@ -934,6 +1306,21 @@ function Watch-Clipboard {
                                 Write-Log "CLEAR-DISK: remote command received - '$($script:SyncDir)' cleared ($removedHere item(s) removed)" "Cyan"
                                 [System.Windows.Forms.Clipboard]::Clear()
                             }
+                        } elseif ($text -match '"Marker"\s*:\s*"FILE_DISK_DIR"') {
+                            # Приём папки: создаём (если её ещё нет) и подтверждаем очисткой буфера.
+                            if ($text -match '"RelPath"\s*:\s*"([^"]+)"') {
+                                $dirRel = (($matches[1] -replace '\\', '/') -split '/' |
+                                    Where-Object { $_ -notin @('', '.', '..') }) -join '/'
+                                if ($dirRel) {
+                                    $dirPath = Join-Path $script:SyncDir ($dirRel -replace '/', '\')
+                                    if (-not (Test-Path -LiteralPath $dirPath)) {
+                                        New-Item -ItemType Directory -Path $dirPath -Force | Out-Null
+                                        Write-Log "SYNC: folder '$dirRel' created" "Cyan"
+                                    }
+                                    Add-DirChangeEntry -Type "RECEIVED" -RelPath $dirRel
+                                }
+                            }
+                            [System.Windows.Forms.Clipboard]::Clear()
                         } else {
                             $processed = Unpack-Files -TargetDir $TargetDir -RawData $text
 
@@ -982,6 +1369,8 @@ function Watch-Clipboard {
             $lastHeartbeat = Get-Date
             $scanInfo = if ($script:DiskSyncEnabled) { "next disk scan in $nextScanMs ms" } else { "disk sync DISABLED" }
             Write-Log "Watch alive: clip=$clipState, $scanInfo, change.log records: $($script:ChangeLog.Count)" "DarkGray"
+            # Ротация журнала и на долгом Watch: без неё журнал растёт бесконечно
+            Rotate-Log
         }
     }
 }
@@ -993,12 +1382,7 @@ function Read-IniItems {
     param([string]$Path)
     $items = New-Object System.Collections.Generic.List[object]
     if (-not (Test-Path -LiteralPath $Path)) { return $items }
-    $bytes = [System.IO.File]::ReadAllBytes($Path)
-    $text  = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
-    } else {
-        [System.Text.Encoding]::UTF8.GetString($bytes)
-    }
+    $text = Read-TextFile -Path $Path
     $section = ""
     foreach ($raw in ($text -split "`r?`n")) {
         $line  = $raw.TrimEnd("`r")
@@ -1076,8 +1460,9 @@ function Remove-IniKeyItem {
 function Restart-WatchIfRunning {
     # Если фоновый слушатель работает - перезапускаем его, чтобы изменения настроек
     # или журнала change.log вступили в силу немедленно.
-    $running = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*FileTransfer.ps1*Watch*" })
+    $running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and
+                       $_.CommandLine -like "*FileTransfer.ps1*" -and $_.CommandLine -match '\bWatch\b' })
     if ($running.Count -eq 0) { return }
     foreach ($proc in $running) {
         try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop } catch {}
@@ -1193,10 +1578,25 @@ function Invoke-Resend {
 function Clear-SyncDirLocal {
     # Удаляет ВСЁ содержимое SyncDir (файлы и подпапки), включая change.log,
     # и создаёт пустой change.log заново (чтобы при перезапуске слушателя
-    # не выполнился снапшот). Возвращает число удалённых элементов.
+    # не выполнился снапшот). Перед удалением содержимое архивируется в TEMP:
+    # очистка необратима, случайный .del не должен стоить потери файлов.
+    # Возвращает число удалённых элементов.
     $removed = 0
     if (Test-Path $script:SyncDir) {
-        foreach ($item in @(Get-ChildItem -LiteralPath $script:SyncDir -Force -ErrorAction SilentlyContinue)) {
+        $items = @(Get-ChildItem -LiteralPath $script:SyncDir -Force -ErrorAction SilentlyContinue)
+        if ($items.Count -gt 0) {
+            # Резервная копия перед необратимой очисткой (сбой архивации очистку не блокирует)
+            try {
+                $stamp    = Get-Date -Format "yyyyMMdd-HHmmss"
+                $backupZip = Join-Path (Join-Path $env:TEMP "CHANGE-backup") "CHANGE-$stamp.zip"
+                if (-not (Test-Path (Split-Path -Parent $backupZip))) { New-Item -ItemType Directory -Path (Split-Path -Parent $backupZip) -Force | Out-Null }
+                Compress-Archive -LiteralPath ($items.FullName) -DestinationPath $backupZip -Force
+                Write-Log "CLEAR-DISK: backup saved to '$backupZip'" "DarkGray"
+            } catch {
+                Write-Log "CLEAR-DISK: backup failed - $($_.Exception.Message)" "Yellow"
+            }
+        }
+        foreach ($item in $items) {
             try {
                 Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
                 $removed++
@@ -1233,10 +1633,11 @@ function Invoke-ClearDisk {
     $payload = @{
         Marker = "FILE_DISK_CMD"
         Action = "ClearDisk"
-        Origin = $env:COMPUTERNAME
+        Origin = $script:OwnOrigin
     }
     $json = $payload | ConvertTo-Json -Compress
 
+    $savedClip = Save-ClipText
     $clipOk = $false
     $attempts = $script:ClipRetryAttempts
     while ($attempts -gt 0 -and -not $clipOk) {
@@ -1251,6 +1652,7 @@ function Invoke-ClearDisk {
     if (-not $clipOk) {
         Write-Log "CLEAR-DISK: cannot write command to clipboard! Remote side was NOT cleared." "Red"
         $script:HasError = $true
+        Restore-ClipText $savedClip
         return
     }
     Write-Log "CLEAR-DISK: command sent - waiting for remote listener to clear its SyncDir..." "Cyan"
@@ -1275,6 +1677,7 @@ function Invoke-ClearDisk {
         Write-Log "CLEAR-DISK: no ACK from remote listener (is it running?). Local SyncDir is cleared; run ClearDisk again when the remote listener is up." "Yellow"
         $script:HasError = $true
     }
+    Restore-ClipText $savedClip
 }
 
 function Invoke-MarkDelete {
@@ -1333,9 +1736,9 @@ function Invoke-ManualReceive {
         if ([System.Windows.Forms.Clipboard]::ContainsText()) {
             $text = [System.Windows.Forms.Clipboard]::GetText()
             if ($text -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA)"') {
-                $origin = $env:COMPUTERNAME
+                $origin = $script:OwnOrigin
                 if ($text -match '"Origin"\s*:\s*"([^"]+)"') { $origin = $matches[1] }
-                if ($origin -ne $env:COMPUTERNAME) { $packet = $text }
+                if ($origin -ne $script:OwnOrigin) { $packet = $text }
             }
         }
     } catch {}
