@@ -119,5 +119,18 @@ $lnk.Save()
 
 Write-Host "$listenerVerb : СЛУШАТЕЛЬ -> FileTransfer.ps1 Watch (Автозагрузка)" -ForegroundColor Green
 
+# ===== 4. Дашборд (веб-панель http://localhost:8123) в Автозагрузку =====
+$dashPath  = Join-Path $Startup "CopyPast Дашборд.lnk"
+$dashVerb  = if (Test-Path $dashPath) { "Перезаписан ярлык" } else { "Создан ярлык" }
+$lnk = $shell.CreateShortcut($dashPath)
+$lnk.TargetPath       = $PowerShell
+$lnk.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" Web"
+$lnk.WorkingDirectory = $Destination
+$lnk.WindowStyle      = 7
+$lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,44"
+$lnk.Description      = "CopyPast: веб-дашборд http://localhost:8123"
+$lnk.Save()
+Write-Host "$dashVerb : CopyPast Дашборд -> FileTransfer.ps1 Web (Автозагрузка)" -ForegroundColor Green
+
 Write-Host "`nГотово! Ярлыки находятся в: $SendTo" -ForegroundColor Cyan
 Write-Host "Слушатель в Автозагрузке: $listenerPath" -ForegroundColor Cyan

@@ -232,6 +232,13 @@ if (-not (Test-Path $syncDir)) {
 try {
     Copy-Item -Path $targetScript -Destination (Join-Path $syncDir "FileTransfer.ps1") -Force
     Copy-Item -Path $iniTarget -Destination (Join-Path $syncDir "setcp.ini") -Force
+    # Макет веб-дашборда (читается Invoke-WebStatus рядом со скриптом).
+    # В SyncDir тоже: слушатель доставит его на другой контур, AutoUpdate применит.
+    $tplSource = Join-Path $PSScriptRoot "dashboard.html"
+    if (Test-Path $tplSource) {
+        Copy-Item -Path $tplSource -Destination (Join-Path $Destination "dashboard.html") -Force
+        Copy-Item -Path $tplSource -Destination (Join-Path $syncDir "dashboard.html") -Force
+    }
     Write-Step "Обновления скопированы в $syncDir - слушатель отправит их на другой контур автоматически." "Green"
 } catch {
     Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось скопировать обновления в $syncDir - $($_.Exception.Message)" "Yellow"

@@ -191,6 +191,12 @@ Pause::
 
 ; ==================== ГЛОБАЛЬНЫЕ ХОТКЕИ ДЛЯ ПЕРЕДАЧИ ФАЙЛОВ ====================
 
+; Ctrl + Alt + W — История передач (окно можно закрыть — слушателю не вредит)
+^!sc011::
+{
+    Run('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\CHANGE\FileTransfer.ps1" History', , "Min")
+}
+
 ; Ctrl + Alt + C — Send File
 ^!sc02E::
 {

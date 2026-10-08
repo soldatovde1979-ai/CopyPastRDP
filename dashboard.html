@@ -1,0 +1,103 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>CopyPast Dashboard — {MACHINE}</title><style>
+html,body{height:100%;margin:0}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#171a21;color:#dfe3ea;display:flex;flex-direction:column;overflow:hidden;padding:0 24px}
+h1{font-size:20px;margin:14px 0 12px}
+.card{background:#232833;border-radius:10px;padding:14px 18px;margin-bottom:14px}
+.st{font-size:15px;font-weight:600}.on{color:#5fd86b}.off{color:#ff6b6b}
+.btn{border:0;border-radius:6px;padding:7px 14px;font-size:13px;cursor:pointer;color:#fff;margin-left:10px}
+.stop{background:#a33}.start{background:#2d7d46}
+.sub{color:#8a93a5;font-size:12px;font-weight:400}
+.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.toolbar .btn.tool{margin-left:0;background:#2d3a4d}
+.toolbar .btn.tool.warn{background:#7a4a1d}
+.toolbar .grp{display:inline-flex;align-items:center;gap:6px;margin-left:4px}
+.toolbar .num{width:52px;background:#171a21;border:1px solid #3a4356;border-radius:6px;color:#dfe3ea;padding:6px;font-size:13px}
+.toolbar #note{margin-left:10px}
+.logwrap{flex:1;overflow-y:auto;background:#232833;border-radius:10px;padding:6px 18px 14px;margin-bottom:16px}
+table{border-collapse:collapse;width:100%}td{padding:3px 8px;border-bottom:1px solid #262b35;font-size:13px;vertical-align:top}
+th{text-align:left;color:#8a93a5;font-size:12px;padding:6px 8px;position:sticky;top:0;background:#232833}
+td:first-child{white-space:nowrap;color:#8a93a5}
+/* Цвета событий: серый — служебные (передачи, статусы), жёлтый — предупреждения,
+   красный — ошибки. Зелёный — только индикаторы «работает/на связи» (.on). */
+tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.bad td:nth-child(2){color:#ff8080}
+/* Полоса прогресса активных передач */
+.prow{margin:6px 0}
+.ptitle{font-size:13px;margin-bottom:3px}
+.pbar{height:8px;background:#171a21;border-radius:4px;overflow:hidden}
+.pfill{height:100%;background:#4a90d9;border-radius:4px}
+#drop{border:2px dashed #3a4356;padding:22px;text-align:center;color:#8a93a5;cursor:pointer}
+#drop.over{border-color:#7cc7ff;color:#7cc7ff}
+</style></head><body>
+<div class="top">
+<h1>CopyPast — дашборд <span class="sub">{MACHINE} · обновление каждые 3 сек</span></h1>
+<div class="card">{STATUS}</div>
+{TOOLS}
+{REMOTE_CARD}
+{PROGRESS}
+<div class="card" id="drop">&#128230; Перетащите сюда файлы — уйдут на другой ПК<br><span style="font-size:11px">крупные файлы и папки — лучше архивом (7z/zip)</span></div>
+</div>
+<div class="logwrap"><table>
+<tr><th>Время</th><th>Событие</th></tr>
+{ROWS}
+</table></div>
+<script>
+var uploading = false;
+// Автообновление без meta refresh: на время загрузки файлов пауза,
+// иначе перезагрузка молча рвёт POST /drop (файл пропадал без следа).
+setInterval(function(){ if (!uploading) location.reload(); }, 3000);
+function post(p){ fetch(p,{method:'POST'}).then(function(){ location.reload(); }); }
+function note(msg){ var el=document.getElementById('note'); el.textContent=msg; setTimeout(function(){ el.textContent=''; }, 6000); }
+function copyLog(){
+  var n = document.getElementById('copyn').value || 10;
+  fetch('/copylog?n='+n).then(function(r){ return r.text(); }).then(function(t){
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(function(){ note('Скопировано: '+n+' событий'); });
+    } else {
+      var ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove(); note('Скопировано: '+n+' событий');
+    }
+  });
+}
+var dz = document.getElementById('drop');
+var dzHint = dz.innerHTML;
+dz.addEventListener('dragover', function(e){e.preventDefault(); dz.classList.add('over')});
+dz.addEventListener('dragleave', function(e){dz.classList.remove('over')});
+dz.addEventListener('drop', function(e){
+  e.preventDefault(); dz.classList.remove('over');
+  var files = e.dataTransfer.files;
+  if (!files.length) return;
+  uploading = true;
+  var pending = files.length;
+  dz.innerHTML = 'Передача в SyncDir... ' + pending + ' файл(ов)';
+  for (var i = 0; i < files.length; i++) {
+    (function(f){
+      var r = new FileReader();
+      r.onload = function(){
+        var b64 = r.result.split(',')[1];
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/drop', true);
+        xhr.setRequestHeader('Content-Type','application/json');
+        xhr.onload = function(){
+          pending--;
+          if (xhr.status !== 200) {
+            note('ОШИБКА загрузки ' + f.name + ' (HTTP ' + xhr.status + '): ' + xhr.responseText);
+            dz.innerHTML = 'Не удалось: ' + f.name + '<br>' + dzHintSafe();
+          } else if (pending > 0) {
+            dz.innerHTML = 'Передача в SyncDir... осталось ' + pending;
+          }
+          if (pending <= 0) { uploading = false; location.reload(); }
+        };
+        xhr.onerror = function(){
+          pending--;
+          note('ОШИБКА сети при загрузке ' + f.name);
+          if (pending <= 0) { uploading = false; dz.innerHTML = dzHintSafe(); }
+        };
+        xhr.send(JSON.stringify({name: f.name, data: b64}));
+      };
+      r.readAsDataURL(f);
+    })(files[i]);
+  }
+});
+function dzHintSafe(){ return dzHint = 'Ошибка загрузки — см. сообщение выше. <a href="#" onclick="location.reload();return false">Обновить</a>'; }
+</script></body></html>

@@ -156,6 +156,7 @@ $script:WatchTrace        = Get-IniBool -Section "Settings" -Key "WatchTrace"   
 # не пишутся ни в журнал, ни в консоль; DebugLevel=1 — полный лог.
 if ($DebugLevel -lt 0) { $DebugLevel = [int](Get-IniValue -Section "Settings" -Key "Debug" -Default "0") }
 $script:DebugEnabled = ($DebugLevel -ne 0)
+$script:ProgressActivity = "CopyPast"
 
 # Рабочие каталоги и журнал
 $IN_DIR   = Get-IniPath -Section "Paths" -Key "InDir"   -Default "C:\CHANGE\IN"
@@ -209,6 +210,13 @@ $script:LastLocked = @{}
 # объекта: изменился файл (новое содержимое) — счётчик неудач сбрасывается.
 $script:SendFailures = @{}
 
+# Старты приёма файлов (FileId -> время первого чанка) — для строки «ПРИНЯТО за N сек»
+$script:ReceiveStarts = @{}
+
+# Единый фильтр «значимых» событий: и в status-файл, и в историю дашборда.
+# Один источник — фильтры не разъезжаются (правка в одном месте).
+$script:DashboardEventPattern = 'ОТПРАВКА|ОТПРАВЛЕНО|ПРИЁМ|ПРИНЯТО|НЕ ПЕРЕДАНО|FAIL|FATAL|ERROR|WARNING|CLEAR-DISK|DEL-MARKER|AUTOUPDATE|DROP'
+
 # Персистентный журнал диска change.log (внутри SyncDir): ключ "relpath|длина|LastWriteTimeUtc"
 # -> тип записи (SNAPSHOT/SENT/RECEIVED/LOCKED). Заменяет in-memory-память: что отправлено
 # или принято, переживает перезапуск слушателя и защищает от петель.
@@ -232,7 +240,8 @@ function Write-Log {
         $Message -notmatch '^===== (START|END)') { return }
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $label = if ($script:CurrentAction) { $script:CurrentAction } else { "SendFile" }
-    try { Add-Content -Path $LOG_FILE -Value "[$timestamp] [$label] $Message" -Encoding UTF8 } catch {}
+    try { Add-Content -Path $LOG_FILE -Value "[$timestamp] [$label] $Message" -Encoding UTF8 }
+    catch { Write-Host "WARNING: журнал недоступен: $($_.Exception.Message)" -ForegroundColor Yellow }
     Write-Host $Message -ForegroundColor $Color
 }
 
@@ -248,6 +257,35 @@ function Rotate-Log {
             }
         }
     } catch {}
+}
+
+# ===== ПРОГРЕСС ПЕРЕДАЧ (для веб-дашборда) =====
+# Watch/PackAuto пишет progress-<имя ПК>.json в корень SyncDir на каждый чанк;
+# дашборд читает его и рисует полосу прогресса. Файл уезжает синхронизацией,
+# поэтому «едет ко мне / от меня» видно на ОБОИХ контурах. По завершении или
+# ошибке файл удаляется.
+function Update-ProgressState {
+    param(
+        [string]$Name, [int]$Chunk, [int]$Total,
+        [ValidateSet("send", "recv")][string]$Dir,
+        [datetime]$Started
+    )
+    try {
+        $st = @{
+            Machine = $env:COMPUTERNAME
+            File    = $Name
+            Dir     = $Dir
+            Chunk   = $Chunk
+            Total   = $Total
+            Started = $Started.ToString("yyyy-MM-dd HH:mm:ss")
+        }
+        $p = Join-Path $script:SyncDir ("progress-{0}.json" -f $env:COMPUTERNAME)
+        $st | ConvertTo-Json -Compress | Set-Content -LiteralPath $p -Encoding UTF8
+    } catch {}
+}
+
+function Clear-ProgressState {
+    Remove-Item -LiteralPath (Join-Path $script:SyncDir ("progress-{0}.json" -f $env:COMPUTERNAME)) -Force -ErrorAction SilentlyContinue
 }
 
 # ===== ОБЩАЯ ЧАНКОВАЯ ОТПРАВКА (Pack и синхронизация) =====
@@ -271,7 +309,23 @@ function Send-FileInChunks {
     # MD5 всего файла: приёмник сверяет собранный файл и отбраковывает битое
     try { $fileHash = (Get-FileHash -LiteralPath $File.FullName -Algorithm MD5).Hash } catch { $fileHash = "" }
 
+    $fileHash = ""
+    try { $fileHash = (Get-FileHash -LiteralPath $File.FullName -Algorithm MD5).Hash } catch {}
+
+    # Окно не показываем принудительно (не мешает работе): история доступна
+    # командой History и в журнале
+    $stage = if ($RelPath) { "ОТПРАВКА на другой ПК: $RelPath" } else { "ОТПРАВКА на другой ПК: $($File.Name)" }
+    $script:ProgressActivity = "CopyPast — $stage"
+    Write-Progress -Activity $script:ProgressActivity -Status "0 из $([math]::Ceiling($File.Length / 1MB)) МБ" -PercentComplete 0 -ErrorAction SilentlyContinue
+
     $savedClip = Save-ClipText
+    $sendStart = Get-Date
+    # Старт операции с параметрами (виден всегда; служебные status-файлы — нет):
+    # файл, объём, число чанков — чтобы по журналу было ясно, ЧТО копируется
+    if ($RelPath -notmatch '^(status|progress)-') {
+        Write-Log "ОТПРАВКА: '$(if ($RelPath) { $RelPath } else { $File.Name })' ($([math]::Round($File.Length / 1MB, 2)) МБ, $totalChunks чанк(ов)) на другой ПК" "White"
+        Update-ProgressState -Name $(if ($RelPath) { $RelPath } else { $File.Name }) -Chunk 0 -Total $totalChunks -Dir send -Started $sendStart
+    }
     $stream = [System.IO.File]::OpenRead($File.FullName)
     try {
         $buffer = New-Object byte[] $chunkSizeBytes
@@ -313,6 +367,8 @@ function Send-FileInChunks {
             if (-not $clipOk) {
                 Write-Log "FATAL: Cannot write chunk $chunkIndex/$totalChunks to clipboard!" "Red"
                 $script:HasError = $true
+                Write-Progress -Activity $script:ProgressActivity -Completed -ErrorAction SilentlyContinue
+                Clear-ProgressState
                 Restore-ClipText $savedClip
                 return $false
             }
@@ -320,7 +376,13 @@ function Send-FileInChunks {
             Write-Log "   -> Chunk $chunkIndex/$totalChunks sent. Waiting for ACK..." "Gray"
 
             if ($SyncMode) {
-                if (-not (Wait-SyncAck -RelPath $RelPath)) { Restore-ClipText $savedClip; return $false }
+                if (-not (Wait-SyncAck -RelPath $RelPath)) {
+                    Write-Progress -Activity $script:ProgressActivity -Completed -ErrorAction SilentlyContinue
+                    Clear-ProgressState
+                    Notify-WatchFailure
+                    Restore-ClipText $savedClip
+                    return $false
+                }
             } else {
                 # Ручная отправка: если приёмник не забрал чанк за SyncAckTimeoutSec —
                 # обрываем передачу (иначе отправка висела бы вечно). Файл НЕ удаляется.
@@ -335,12 +397,16 @@ function Send-FileInChunks {
                 if (-not $acked) {
                     Write-Log "FATAL: receiver did not pick up chunk $chunkIndex/$totalChunks within $script:SyncAckTimeoutSec sec - transfer aborted, file kept. Is the listener running on the other side?" "Red"
                     $script:HasError = $true
+                    Write-Progress -Activity $script:ProgressActivity -Completed -ErrorAction SilentlyContinue
+                    Clear-ProgressState
                     Restore-ClipText $savedClip
                     return $false
                 }
             }
 
             $chunkIndex++
+            Write-Progress -Activity $script:ProgressActivity -Status "передано $([math]::Round(($chunkIndex-1) * $ChunkSizeMB, 0)) из $([math]::Ceiling($File.Length / 1MB)) МБ" -PercentComplete ([math]::Min(99, [int](100 * ($chunkIndex-1) / $totalChunks))) -ErrorAction SilentlyContinue
+            Update-ProgressState -Name $(if ($RelPath) { $RelPath } else { $File.Name }) -Chunk ($chunkIndex - 1) -Total $totalChunks -Dir send -Started $sendStart
             if ($File.Length -eq 0) { break }
         }
     } finally {
@@ -349,6 +415,15 @@ function Send-FileInChunks {
     }
 
     Restore-ClipText $savedClip
+    Write-Progress -Activity $script:ProgressActivity -Completed -ErrorAction SilentlyContinue
+    # Итоговая строка (видна всегда): что, куда, объём, время.
+    # Служебные статус-файлы дашборда не логируем — они едут каждые 30 сек.
+    Clear-ProgressState
+    if ($RelPath -notmatch '^(status|progress)-') {
+        $durSec = [int]((Get-Date) - $sendStart).TotalSeconds
+        $sizeMb = [math]::Round($File.Length / 1MB, 2)
+        Write-Log "ОТПРАВЛЕНО: '$(if ($RelPath) { $RelPath } else { $File.Name })' ($sizeMb МБ, $totalChunks чанк(ов)) на другой ПК за $durSec сек" "White"
+    }
     return $true
 }
 
@@ -617,11 +692,13 @@ function Unpack-Files {
             # сохраняется в КОРЕНЬ SyncDir, иначе очистка на этом контуре не сработает.
             # .synczip (пакетный архив) — тоже строго в корень.
             if ($script:RoutesEnabled -and $syncRel -ne '.del' -and $syncRel -notmatch '\.synczip$') {
-                foreach ($route in $script:Routes) {
-                    if ($safeName -like $route.Mask) {
-                        $syncTarget = $route.Target
-                        $routeMask  = $route.Mask
-                        break
+                if ($safeName -notmatch '^(status|progress)-') {
+                    foreach ($route in $script:Routes) {
+                        if ($safeName -like $route.Mask) {
+                            $syncTarget = $route.Target
+                            $routeMask  = $route.Mask
+                            break
+                        }
                     }
                 }
             }
@@ -651,10 +728,12 @@ function Unpack-Files {
             # передача начнётся заново со следующего скана/попытки
             Write-Log "FAIL: chunk $($data.ChunkIndex) for '$safeName' but '.part' is missing - transfer restarts" "Red"
             $script:HasError = $true
+            Clear-ProgressState
             return $false
         }
 
         $bytes = [Convert]::FromBase64String($data.Content)
+        if (-not $script:ReceiveStarts.ContainsKey($data.FileId)) { $script:ReceiveStarts[$data.FileId] = Get-Date }
         $outStream = New-Object System.IO.FileStream($partPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
         try {
             if ($bytes.Length -gt 0) { $outStream.Write($bytes, 0, $bytes.Length) }
@@ -664,6 +743,17 @@ function Unpack-Files {
         }
 
         Write-Log "Received chunk $($data.ChunkIndex)/$($data.TotalChunks) for '$safeName'" "Gray"
+        # Старт приёма с параметрами (виден всегда; служебные статус-файлы — нет)
+        if ($safeName -notmatch '^(status|progress)-') {
+            if ($data.ChunkIndex -eq 1) {
+                # ВНИМАНИЕ: только $() внутри строки — "$data.TotalChunks" развернёт
+                # весь объект $data вместе с Content (base64-чанк) в строку лога
+                Write-Log "ПРИЁМ: '$safeName' ($([math]::Round($data.TotalChunks * $ChunkSizeMB, 0)) МБ, $($data.TotalChunks) чанк(ов)) с другого ПК" "White"
+            }
+            $rStart0 = if ($script:ReceiveStarts.ContainsKey($data.FileId)) { $script:ReceiveStarts[$data.FileId] } else { Get-Date }
+            Update-ProgressState -Name $safeName -Chunk $data.ChunkIndex -Total $data.TotalChunks -Dir recv -Started $rStart0
+            Write-Progress -Activity "CopyPast — ПРИЁМ с другого ПК: $safeName" -Status "чанк $($data.ChunkIndex) из $($data.TotalChunks)" -PercentComplete ([math]::Min(99, [int](100 * $data.ChunkIndex / $data.TotalChunks))) -ErrorAction SilentlyContinue
+        }
 
         if ($data.ChunkIndex -eq $data.TotalChunks) {
             if (Test-Path $finalPath) { Remove-Item $finalPath -Force }
@@ -679,6 +769,7 @@ function Unpack-Files {
                     Write-Log "FAIL: MD5 mismatch for '$safeName' ($gotHash <> $expectHash) - file deleted, will be resent" "Red"
                     Remove-Item $finalPath -Force -ErrorAction SilentlyContinue
                     $script:HasError = $true
+                    Clear-ProgressState
                     return $false
                 }
             }
@@ -694,11 +785,22 @@ function Unpack-Files {
                 # Помечаем принятый файл как обработанный, чтобы не отправить его обратно (петля)
                 $item = Get-Item $finalPath -ErrorAction SilentlyContinue
                 if ($item) { Add-ChangeEntry -Type "RECEIVED" -RelPath $syncRel -Item $item }
-                Write-Log "SUCCESS: Sync file '$syncRel' completely assembled!" "Green"
+                # Служебные файлы дашборда не логируем — едут постоянно
+                if ($safeName -notmatch '^(status|progress)-') {
+                    Write-Log "SUCCESS: Sync file '$syncRel' completely assembled!" "Green"
+                }
+                $rStart = $script:ReceiveStarts[$data.FileId]
+                $dur = if ($rStart) { [int]((Get-Date) - $rStart).TotalSeconds } else { 0 }
+                $script:ReceiveStarts.Remove($data.FileId)
+                if ($safeName -notmatch '^(status|progress)-') {
+                    $sizeMbR = [math]::Round((Get-Item -LiteralPath $finalPath).Length / 1MB, 2)
+                    Write-Log "ПРИНЯТО: '$safeName' ($sizeMbR МБ, $($data.TotalChunks) чанк(ов)) с другого ПК за $dur сек" "White"
+                }
+                Clear-ProgressState
 
                 # Самообновление: файлы FileTransfer.ps1 / setcp.ini, пришедшие в корень SyncDir,
                 # применяются в каталог запущенного скрипта, после чего слушатель перезапускается.
-                if ($script:AutoUpdate -and $syncRel -notmatch '/' -and $safeName -in @('FileTransfer.ps1', 'setcp.ini')) {
+                if ($script:AutoUpdate -and $syncRel -notmatch '/' -and $safeName -in @('FileTransfer.ps1', 'setcp.ini', 'dashboard.html')) {
                     # .ps1 перед применением проверяется синтаксически: битое
                     # обновление (обрыв передачи) убил бы слушателя на обоих контурах
                     $apply = $true
@@ -714,16 +816,36 @@ function Unpack-Files {
                     if ($apply) {
                         $rootDir = Split-Path -Parent $PSCommandPath
                         try {
-                            Copy-Item -Path $finalPath -Destination (Join-Path $rootDir $safeName) -Force
-                            Write-Log "AUTOUPDATE: '$safeName' applied to $rootDir - listener will restart" "Cyan"
-                            $script:RestartNeeded = $true
+                            # Файл с тем же содержимым не применяем и не рестартуем —
+                            # иначе два контура вечно перекидываются копиями (restart-петля)
+                            $currentPath = Join-Path $rootDir $safeName
+                            $same = $false
+                            if (Test-Path $currentPath) {
+                                $h1 = (Get-FileHash -LiteralPath $finalPath -Algorithm MD5).Hash
+                                $h2 = (Get-FileHash -LiteralPath $currentPath -Algorithm MD5).Hash
+                                $same = ($h1 -eq $h2)
+                            }
+                            if ($same) {
+                                Write-Log "AUTOUPDATE: '$safeName' is identical - skipped" "DarkGray"
+                            } else {
+                                Copy-Item -Path $finalPath -Destination $currentPath -Force
+                                Write-Log "AUTOUPDATE: '$safeName' applied to $rootDir - listener will restart" "Cyan"
+                                $script:RestartNeeded = $true
+                            }
                         } catch {
                             Write-Log "AUTOUPDATE: FAILED to apply '$safeName' - $($_.Exception.Message)" "Red"
                         }
                     }
                 }
             } else {
-                Write-Log "SUCCESS: File '$safeName' completely assembled!" "Green"
+                $rStart = $script:ReceiveStarts[$data.FileId]
+                $dur = if ($rStart) { [int]((Get-Date) - $rStart).TotalSeconds } else { 0 }
+                $script:ReceiveStarts.Remove($data.FileId)
+                if ($safeName -notmatch '^(status|progress)-') {
+                    $sizeMbR = [math]::Round((Get-Item -LiteralPath $finalPath).Length / 1MB, 2)
+                    Write-Log "ПРИНЯТО: '$safeName' ($sizeMbR МБ, $($data.TotalChunks) чанк(ов)) с другого ПК за $dur сек" "White"
+                }
+                Clear-ProgressState
             }
             [System.Media.SystemSounds]::Asterisk.Play()
         }
@@ -838,7 +960,8 @@ function Wait-SyncAck {
         }
         if ((Get-Date) -gt $deadline) {
             try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
-            Write-Log "SYNC: ACK timeout for '$RelPath' - packet pulled back. Is the listener running on the other side?" "Yellow"
+            Write-Log "НЕ ПЕРЕДАНО: '$RelPath' — приёмник не отвечает (ждали $script:SyncAckTimeoutSec сек), повтор автоматически" "Yellow"
+            Notify-WatchFailure
             return $false
         }
     }
@@ -908,6 +1031,48 @@ function Add-DirChangeEntry {
     try { Add-Content -LiteralPath $script:ChangeLogPath -Value $line -Encoding UTF8 } catch {}
 }
 
+# ===== ОКНА: ПРОГРЕСС И ОПОВЕЩЕНИЯ =====
+# Win32-обёртка для показа/свёртывания консоли длительных операций
+Add-Type -Namespace CopyPast -Name Console -MemberDefinition '
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);' `
+    -ErrorAction SilentlyContinue
+
+function Show-ConsoleWindow {
+    # Показывает окно консоли (ярлыки SendTo запускают свёрнуто, Watch — скрыто):
+    # длительные операции должны быть видны. SW_SHOWNOACTIVATE=4 — не крадёт фокус.
+    try {
+        $h = [CopyPast.Console]::GetConsoleWindow()
+        if ($h -and $h -ne [IntPtr]::Zero) { [void][CopyPast.Console]::ShowWindow($h, 4) }
+    } catch {}
+}
+
+function Hide-ConsoleWindow {
+    try {
+        $h = [CopyPast.Console]::GetConsoleWindow()
+        if ($h -and $h -ne [IntPtr]::Zero) { [void][CopyPast.Console]::ShowWindow($h, 6) }  # SW_MINIMIZE=6
+    } catch {}
+}
+
+function Show-Alert {
+    # Оповещение о проблеме: TimeoutSec=0 — окно ждёт OK (пользовательские
+    # операции), >0 — закрывается само (фоновые события, чтобы не копить окна)
+    param([string]$Text, [string]$Title = "CopyPast", [int]$TimeoutSec = 0)
+    try {
+        $sh = New-Object -ComObject WScript.Shell
+        [void]$sh.Popup($Text, $TimeoutSec, $Title, 48)  # 48 = иконка "!"
+    } catch {}
+}
+
+function Notify-WatchFailure {
+    # Приёмник не отвечает: окно для пользователя. Не чаще раза в 10 минут,
+    # иначе очередь из сотен файлов засыплет окнами
+    if ($script:LastFailNotify -and (((Get-Date) - $script:LastFailNotify).TotalMinutes -lt 10)) { return }
+    $script:LastFailNotify = Get-Date
+    Show-Alert -Text "Синхронизация CopyPast: приёмник не отвечает (ACK timeout).`nОтправка будет повторена автоматически.`n`nПодробности: $LOG_FILE" `
+        -Title "CopyPast: приёмник не отвечает" -TimeoutSec 15
+}
+
 function Send-SyncFile {
     # Отправка файла из SyncDir чанками на тот же относительный путь (RelPath)
     # в другом контуре. Общая чанковая логика - в Send-FileInChunks.
@@ -922,7 +1087,10 @@ function Send-SyncFile {
         return $false
     }
 
-    Write-Log "SYNC: '$RelPath' fully transferred!" "Green"
+    # Служебные файлы дашборда не логируем — иначе они забивают историю
+    if ($RelPath -notmatch '^(status|progress)-') {
+        Write-Log "SYNC: '$RelPath' fully transferred!" "Green"
+    }
     return $true
 }
 
@@ -969,11 +1137,14 @@ function New-SyncBatchZip {
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zipPath = Join-Path $script:SyncDir ".syncbatch.synczip"
+    Write-Progress -Activity "CopyPast — АРХИВИРОВАНИЕ очереди (этап 1 из 2: архив, далее отправка)" -Status "0 из $($Files.Count) файлов" -PercentComplete 0 -ErrorAction SilentlyContinue
     try {
         $fs = [System.IO.File]::Open($zipPath, 'Create')
         $zip = New-Object System.IO.Compression.ZipArchive($fs, 'Create', $false, [System.Text.Encoding]::UTF8)
         try {
+            $n = 0
             foreach ($pf in $Files) {
+                $n++
                 $rel = Get-RelPath -FullName $pf.File.FullName
                 $entry = $zip.CreateEntry($rel, [System.IO.Compression.CompressionLevel]::Optimal)
                 $es = $entry.Open()
@@ -981,6 +1152,9 @@ function New-SyncBatchZip {
                     $src = [System.IO.File]::OpenRead($pf.File.FullName)
                     try { $src.CopyTo($es) } finally { $src.Close(); $src.Dispose() }
                 } finally { $es.Close(); $es.Dispose() }
+                if ($n % 20 -eq 0 -or $n -eq $Files.Count) {
+                    Write-Progress -Activity "CopyPast — АРХИВИРОВАНИЕ очереди (этап 1 из 2: архив, далее отправка)" -Status "$n из $($Files.Count) файлов" -PercentComplete ([math]::Min(99, [int](100 * $n / $Files.Count))) -ErrorAction SilentlyContinue
+                }
             }
             # Пустые папки — записями-каталогами и манифестом на всякий случай
             $dirsLine = ($DirRelPaths -join "`r`n")
@@ -990,8 +1164,10 @@ function New-SyncBatchZip {
             $w.Write($dirsLine)
             $w.Flush(); $w.Close()
         } finally { $zip.Dispose(); $fs.Close(); $fs.Dispose() }
+        Write-Progress -Activity "CopyPast — АРХИВИРОВАНИЕ очереди (этап 1 из 2: архив, далее отправка)" -Completed -ErrorAction SilentlyContinue
     } catch {
         Write-Log "SYNC: cannot build batch zip - $($_.Exception.Message)" "Red"
+        Write-Progress -Activity "CopyPast — АРХИВИРОВАНИЕ очереди (этап 1 из 2: архив, далее отправка)" -Completed -ErrorAction SilentlyContinue
         return $null
     }
     return $zipPath
@@ -1139,6 +1315,7 @@ function Scan-SyncDir {
                 Register-SyncFailure -RelPath ".syncbatch" -SyncKey "batch"
                 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
                 Write-Log "SYNC: batch NOT sent - will retry later (single attempt per backoff window)" "Yellow"
+                Notify-WatchFailure
             }
         }
         return   # пакетный скан обрабатывает всю очередь — персональные отправки не нужны
@@ -1259,6 +1436,27 @@ function Watch-Clipboard {
     # Защита от двойного запуска: завершаем старый экземпляр слушателя, если он есть.
     Stop-OldListeners
 
+    # Единое окно слушателя: скрыто (не мешает); статус — в браузере http://localhost:8123
+    # или Ctrl+Alt+W (History)
+    # Самогенерация MachineId: на контуре, где Install.ps1 не запускался,
+    # иначе Origin без суффикса и статус-файл «status-.json»
+    if ([string]::IsNullOrWhiteSpace($script:MachineId)) {
+        try {
+            $newId = [guid]::NewGuid().ToString("N").Substring(0, 8)
+            $items = Read-IniItems -Path $script:LocalConfigPath
+            if ($items.Count -eq 0) {
+                $items.Add([pscustomobject]@{ Kind = "comment"; Text = "; setcp.local.ini - ЛОКАЛЬНЫЕ настройки ЭТОГО контура"; Section = ""; Key = "" })
+                $items.Add([pscustomobject]@{ Kind = "section"; Text = "[Settings]"; Section = "Settings"; Key = "" })
+            }
+            Set-IniKeyItem -items $items -Section "Settings" -Key "MachineId" -Value $newId
+            Save-IniItems -Path $script:LocalConfigPath -items $items
+            $script:MachineId = $newId
+            $script:OwnOrigin = "$env:COMPUTERNAME@$newId"
+            Write-Log "MachineId generated: $newId (setcp.local.ini)" "Green"
+        } catch {
+            Write-Log "WARNING: cannot generate MachineId - $($_.Exception.Message)" "Yellow"
+        }
+    }
     Write-Log "Started WATCH mode. Listening..." "Magenta"
     if ($script:DiskSyncEnabled) {
         Write-Log "SYNC: disk sync ENABLED, watching '$($script:SyncDir)'..." "Magenta"
@@ -1274,6 +1472,7 @@ function Watch-Clipboard {
     $lastSyncScan  = Get-Date
     $lastKeepAlive = Get-Date
     $lastHeartbeat = Get-Date
+    $lastStatusWrite = (Get-Date).AddSeconds(-30)
 
     while ($true) {
         Start-Sleep -Milliseconds $script:PollIntervalMs
@@ -1358,6 +1557,26 @@ function Watch-Clipboard {
         }
 
         # ===== Диагностика: heartbeat / trace =====
+        # Раз в 30 сек — status-файл для дашборда другого контура (уедет синхронизацией).
+        # Имя по COMPUTERNAME — читаемо на дашборде второй стороны.
+        if ($script:DiskSyncEnabled -and ((Get-Date) - $lastStatusWrite).TotalSeconds -ge 30) {
+            $lastStatusWrite = Get-Date
+            try {
+                $ev = @(Get-Content -LiteralPath $LOG_FILE -Encoding UTF8 -Tail 500 -ErrorAction SilentlyContinue |
+                    Select-String $script:DashboardEventPattern | Select-Object -Last 15 |
+                    ForEach-Object {
+                        $l = $_.ToString()
+                        if ($l -match '^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[[^\]]+\] (.*)$') {
+                            # Обрезаем: одна длинная строка лога не раздует status-файл
+                            $m1 = $matches[2]; if ($m1.Length -gt 300) { $m1 = $m1.Substring(0, 300) + '...' }
+                            @{ T = $matches[1]; M = $m1 }
+                        }
+                    })
+                $st = @{ Machine = $env:COMPUTERNAME; Time = (Get-Date -Format "yyyy-MM-dd HH:mm:ss"); Events = $ev }
+                $stPath = Join-Path $script:SyncDir ("status-{0}.json" -f $env:COMPUTERNAME)
+                $st | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $stPath -Encoding UTF8
+            } catch {}
+        }
         $nextScanMs = if ($script:DiskSyncEnabled) {
             [math]::Max(0, [int]($script:SyncPollMs - ((Get-Date) - $lastSyncScan).TotalMilliseconds))
         } else { -1 }
@@ -1406,7 +1625,7 @@ function Read-IniItems {
             $items.Add([pscustomobject]@{ Kind = "comment"; Text = $line; Section = $section; Key = "" })
         }
     }
-    return $items
+    return ,$items
 }
 
 function Save-IniItems {
@@ -1788,11 +2007,292 @@ function Invoke-ManualReceive {
     return ($moved -gt 0)
 }
 
+function Invoke-History {
+    # FileTransfer.ps1 History — история последних операций (отдельное окно,
+    # его закрытие не влияет на слушателя)
+    $entries = @(Get-Content -LiteralPath $LOG_FILE -Encoding UTF8 -ErrorAction SilentlyContinue |
+        Select-String 'ОТПРАВЛЕНО|ПРИНЯТО|НЕ ПЕРЕДАНО|FAIL|FATAL|ERROR|WARNING' |
+        Select-Object -Last 30)
+    Write-Host "================ ИСТОРИЯ ПЕРЕДАЧ (последние $($entries.Count) событий) ================" -ForegroundColor Cyan
+    if ($entries.Count -eq 0) { Write-Host "Пока нет событий." "Gray" }
+    foreach ($e in $entries) {
+        $line = $e.ToString()
+        $c = "Gray"
+        if ($line -match 'FAIL|FATAL|ERROR|НЕ ПЕРЕДАНО|WARNING') { $c = "Red" }
+        elseif ($line -match 'ОТПРАВЛЕНО') { $c = "Green" }
+        elseif ($line -match 'ПРИНЯТО') { $c = "Cyan" }
+        # Компактный формат: время + событие
+        $line -replace '^\[(\d{4}-\d{2}-\d{2} )?(\d{2}:\d{2}:\d{2})\] \[[^\]]+\] ', '$2  ' | ForEach-Object { Write-Host $_ -ForegroundColor $c }
+    }
+    Write-Host "================ журнал: $LOG_FILE ================" -ForegroundColor Cyan
+}
+
+function Get-DashboardState {
+    # Общий срез для дашборда и кнопки «Скопировать»: события локального
+    # журнала + события другого контура из status-*.json, свежие сверху.
+    $state = @{ Events = @(); RemoteName = ""; RemoteAge = -1 }
+    $events = New-Object System.Collections.Generic.List[object]
+    $local = @(Get-Content -LiteralPath $LOG_FILE -Encoding UTF8 -Tail 2000 -ErrorAction SilentlyContinue |
+        Select-String $script:DashboardEventPattern |
+        Select-Object -Last 60)
+    foreach ($e in $local) {
+        $line = $e.ToString()
+        if ($line -match '^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[[^\]]+\] (.*)$') { $t = $matches[1]; $m = $matches[2] } else { $t = ''; $m = $line }
+        $events.Add([pscustomobject]@{ T = $t; M = $m })
+    }
+    $remoteFiles = @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "status-*.json" -ErrorAction SilentlyContinue)
+    foreach ($rf in $remoteFiles) {
+        try {
+            # Свой статус-файл пропускаем — его события и так в локальной истории
+            if ($rf.Name -ieq "status-$env:COMPUTERNAME.json") { continue }
+            $j = $rf | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
+            $state.RemoteName = $j.Machine
+            $state.RemoteAge = [int]((Get-Date) - [datetime]::ParseExact($j.Time, "yyyy-MM-dd HH:mm:ss", $null)).TotalSeconds
+            foreach ($ev in @($j.Events)) {
+                $m0 = [string]$ev.M; if ($m0.Length -gt 300) { $m0 = $m0.Substring(0, 300) + '...' }
+                $events.Add([pscustomobject]@{ T = $ev.T; M = "[$($j.Machine)] $m0" })
+            }
+        } catch {}
+    }
+    $state.Events = @($events | Sort-Object -Property T -Descending)
+    return $state
+}
+
+function Invoke-WebStatus {
+    # FileTransfer.ps1 Web — веб-дашборд на http://localhost:8123
+    # Статус слушателя, кнопки старт/стоп, история передач ОБОИХ контуров:
+    # каждый слушатель пишет status-<MachineId>.json в SyncDir, синхронизация
+    # доставляет его на другой ПК, дашборд читает оба файла.
+    Add-Type -AssemblyName System.Net
+    $listener = [System.Net.HttpListener]::new()
+    $listener.Prefixes.Add("http://localhost:8123/")
+    try { $listener.Start() } catch {
+        Write-Log "WEB: cannot start on 8123 (already running?) - $($_.Exception.Message)" "Yellow"
+        return
+    }
+    Write-Log "WEB: dashboard started at http://localhost:8123/" "Green"
+    while ($listener.IsListening) {
+        try { $ctx = $listener.GetContext() } catch { break }
+        $resp = $ctx.Response
+        try {
+            $path = $ctx.Request.Url.AbsolutePath
+            if ($path -eq "/copylog") {
+                # Текст последних N событий — удобно вставить в письмо или чат
+                $n = 10
+                $qs = [string]$ctx.Request.QueryString["n"]
+                [void][int]::TryParse($qs, [ref]$n)
+                if ($n -lt 1 -or $n -gt 200) { $n = 10 }
+                $dash = Get-DashboardState
+                $lines = @($dash.Events | Select-Object -First $n | ForEach-Object {
+                    if ($_.T) { "[$($_.T)] $($_.M)" } else { $_.M }
+                })
+                [array]::Reverse($lines)  # хронологический порядок: старые сверху
+                $textBytes = [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`r`n"))
+                $resp.ContentType = "text/plain; charset=utf-8"
+                $resp.ContentLength64 = $textBytes.Length
+                $resp.OutputStream.Write($textBytes, 0, $textBytes.Length)
+                $resp.OutputStream.Close()
+                continue
+            }
+            if ($ctx.Request.HttpMethod -eq "POST") {
+                if ($path -eq "/drop") {
+                    # Drag&drop из браузера: JSON {name, data(base64)} → файл в SyncDir →
+                    # синхронизация доставит на другой контур
+                    try {
+                        $ms = New-Object System.IO.MemoryStream
+                        $ctx.Request.InputStream.CopyTo($ms)
+                        if ($ms.Length -gt 128MB) {
+                            # Защита: base64-тело в памяти, ограничим input (~96 МБ файла)
+                            $ms.Close(); $ms.Dispose()
+                            $resp.StatusCode = 413
+                            $b = [System.Text.Encoding]::UTF8.GetBytes("файл слишком велик для drop-зоны (>96 МБ) — положите его в SyncDir через Проводник")
+                            $resp.ContentType = "text/plain; charset=utf-8"
+                            $resp.ContentLength64 = $b.Length
+                            $resp.OutputStream.Write($b, 0, $b.Length)
+                            $resp.OutputStream.Close()
+                            continue
+                        }
+                        $body = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+                        $ms.Close(); $ms.Dispose()
+                        $j = $body | ConvertFrom-Json
+                        $safeName = [System.IO.Path]::GetFileName([string]$j.Name)
+                        if ($safeName) {
+                            $bytes = [Convert]::FromBase64String([string]$j.Data)
+                            [System.IO.File]::WriteAllBytes((Join-Path $script:SyncDir $safeName), $bytes)
+                            Write-Log "DROP: '$safeName' ($([math]::Round($bytes.Length / 1MB, 2)) МБ) добавлен в SyncDir" "Green"
+                        }
+                        $resp.StatusCode = 200
+                        $b = [System.Text.Encoding]::UTF8.GetBytes("ok")
+                        $resp.OutputStream.Write($b, 0, $b.Length)
+                    } catch {
+                        try { $resp.StatusCode = 500 } catch {}
+                    }
+                    $resp.OutputStream.Close()
+                    continue
+                }
+                if ($path -eq "/stop") {
+                    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -like "*-File*FileTransfer.ps1*Watch*" } |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                } elseif ($path -eq "/stopall") {
+                    # Стоп всех фоновых заданий CopyPast: слушатель, ручные отправки,
+                    # gw-proxy, хоткеи. Web-процесс (это сами мы) не трогаем.
+                    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -match "FileTransfer\.ps1" -and $_.CommandLine -match "Watch|Pack" -and $_.CommandLine -notmatch "Web" } |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                    Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -like "*gw-proxy.mjs*" } |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                    Get-CimInstance Win32_Process -Filter "Name = 'AutoHotkey64.exe' OR Name = 'AutoHotkey.exe'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -like "*Hotkeys.ahk*" } |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                } elseif ($path -eq "/start") {
+                    Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" Watch" `
+                        -WorkingDirectory (Split-Path -Parent $PSCommandPath)
+                } elseif ($path -eq "/terminal") {
+                    # Терминал рядом со скриптом: Windows Terminal, если есть, иначе PowerShell
+                    $here = Split-Path -Parent $PSCommandPath
+                    if (Get-Command wt.exe -ErrorAction SilentlyContinue) {
+                        Start-Process -FilePath "wt.exe" -WorkingDirectory $here
+                    } else {
+                        Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -WorkingDirectory $here
+                    }
+                } elseif ($path -eq "/restart") {
+                    # Перезапуск слушателя одним кликом: стоп всех + старт нового
+                    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -like "*-File*FileTransfer.ps1*Watch*" } |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                    Start-Sleep -Milliseconds 500
+                    Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" Watch" `
+                        -WorkingDirectory (Split-Path -Parent $PSCommandPath)
+                } elseif ($path -eq "/zoo") {
+                    # Запуск gw-proxy из папки ZOO (настройка [Tools] ZooDir в setcp.ini)
+                    $zooDir = Get-IniPath -Section "Tools" -Key "ZooDir" -Default ""
+                    $zooCmd = if ($zooDir) { Join-Path $zooDir "gw-proxy.cmd" } else { "" }
+                    if ($zooCmd -and (Test-Path $zooCmd -PathType Leaf)) {
+                        Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$zooCmd`"" -WindowStyle Hidden -WorkingDirectory $zooDir
+                    }
+                } elseif ($path -eq "/zoo-stop") {
+                    Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.CommandLine -like "*gw-proxy.mjs*" } |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                } elseif ($path -eq "/opensync") {
+                    Start-Process -FilePath "explorer.exe" -ArgumentList "`"$script:SyncDir`""
+                } elseif ($path -eq "/clearqueue") {
+                    # Очистить очередь: содержимое локального SyncDir (с бэкапом в TEMP).
+                    # Другой контур не затрагивается — в отличие от ClearDisk.
+                    [void](Clear-SyncDirLocal)
+                } elseif ($path -eq "/openlog") {
+                    # Просмотр журнала: LogTracker.ps1, если рядом, иначе блокнот
+                    $ltPath = Join-Path (Split-Path -Parent $PSCommandPath) "LogTracker.ps1"
+                    if (Test-Path $ltPath -PathType Leaf) {
+                        Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ltPath`""
+                    } else {
+                        Start-Process -FilePath "notepad.exe" -ArgumentList "`"$LOG_FILE`""
+                    }
+                }
+                $resp.StatusCode = 302
+                $resp.Headers["Location"] = "/"
+                $resp.OutputStream.Close()
+                continue
+            }
+
+            # Общая история: локальные события + другой контур (через status-*.json)
+            $dash = Get-DashboardState
+
+            # Свежие события сверху
+            $rows = New-Object System.Text.StringBuilder
+            foreach ($ev in $dash.Events) {
+                # Цветовая схема: красный — ошибки, жёлтый — предупреждения,
+                # серый — служебные события (передачи, статусы). Зелёный — только
+                # индикаторы «работает/на связи», не поток событий.
+                $cls = "svc"
+                if ($ev.M -match 'FAIL|FATAL|ERROR|НЕ ПЕРЕДАНО') { $cls = "bad" }
+                elseif ($ev.M -match 'WARNING') { $cls = "warn" }
+                [void]$rows.AppendLine("<tr class='$cls'><td>$($ev.T)</td><td>$([System.Net.WebUtility]::HtmlEncode($ev.M))</td></tr>")
+            }
+
+            # Карточка прогресса: progress-*.json из SyncDir (свой + чужой, уехавший синхронизацией)
+            $progRows = New-Object System.Text.StringBuilder
+            foreach ($pf in @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "progress-*.json" -ErrorAction SilentlyContinue)) {
+                try {
+                    $j = $pf | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
+                    $pct = if ($j.Total -gt 0) { [math]::Min(100, [int](100 * $j.Chunk / $j.Total)) } else { 0 }
+                    $dirTxt = if ($j.Dir -eq "send") { "&rarr; на другой ПК" } else { "&larr; с другого ПК" }
+                    $age = [int]((Get-Date) - [datetime]::ParseExact([string]$j.Started, "yyyy-MM-dd HH:mm:ss", $null)).TotalSeconds
+                    $stale = if ($age -gt 120) { " <span class='sub'>&middot; нет обновлений $age сек</span>" } else { "" }
+                    [void]$progRows.AppendLine("<div class='prow'><div class='ptitle'>${dirTxt}: $([System.Net.WebUtility]::HtmlEncode([string]$j.File)) <span class='sub'>чанк $($j.Chunk)/$($j.Total)$stale</span></div><div class='pbar'><div class='pfill' style='width:$pct%'></div></div></div>")
+                } catch {}
+            }
+            $progressHtml = if ($progRows.Length -gt 0) { "<div class='card' id='progress'>" + $progRows.ToString() + "</div>" } else { "" }
+
+            $watchProcs = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -like "*-File*FileTransfer.ps1*Watch*" })
+            $running = $watchProcs.Count -gt 0
+            $statusHtml = if ($running) {
+                "<span class='st on'>&#9679; Слушатель работает</span> <form method='post' action='/stop' style='display:inline' onsubmit=`"return confirm('Остановить слушателя?')`"><button class='btn stop'>Остановить</button></form>"
+            } else {
+                "<span class='st off'>&#9679; Слушатель ОСТАНОВЛЕН</span> <form method='post' action='/start' style='display:inline'><button class='btn start'>Запустить</button></form>"
+            }
+            $remoteHtmlCard = if ($dash.RemoteName) {
+                $stateTxt = if ($dash.RemoteAge -lt 120) { "<span class='on'>&#9679; на связи</span>" } else { "<span class='off'>&#9679; молчит > 2 мин</span>" }
+                "<div class='card'><div class='st'>Другой контур: $($dash.RemoteName) — $stateTxt <span class='sub'>статус $($dash.RemoteAge) сек назад</span>" +
+                    "<button class='btn tool' style='margin-left:10px' onclick='location.reload()'>Обновить</button></div></div>"
+            } else {
+                "<div class='card'><div class='st off'>Другой контур: статус неизвестен (status-файл не пришёл)</div></div>"
+            }
+
+            # Панель инструментов: терминал, копирование истории, ZOO, SyncDir, журнал.
+            # Статичный HTML — одинарные кавычки в JS, чтобы не экранировать.
+            $zooDir = Get-IniPath -Section "Tools" -Key "ZooDir" -Default ""
+            $zooBtn = ""
+            if ($zooDir -and (Test-Path (Join-Path $zooDir "gw-proxy.cmd") -PathType Leaf)) {
+                $zooRunning = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.CommandLine -like "*gw-proxy.mjs*" }).Count -gt 0
+                if ($zooRunning) {
+                    $zooBtn = "<button class='btn tool warn' onclick=`"if(confirm('Остановить gw-proxy?')) post('/zoo-stop');`">gw-proxy: остановить</button>"
+                } else {
+                    $zooBtn = "<button class='btn tool' onclick=`"post('/zoo');`">gw-proxy: запустить</button>"
+                }
+            }
+            $toolsHtml = "<div class='card toolbar'>" +
+                "<button class='btn tool' onclick=`"post('/terminal');`">Терминал</button>" +
+                "<span class='grp'><input id='copyn' type='number' value='10' min='1' max='200' class='num'>" +
+                "<button class='btn tool' onclick=`"copyLog();`">Скопировать события</button></span>" +
+                "<button class='btn tool warn' onclick=`"if(confirm('Перезапустить слушателя?')) post('/restart');`">Рестарт слушат��ля</button>" +
+                "<button class='btn stop' onclick=`"if(confirm('Остановить ВСЕ задания: слушатель, отправки, gw-proxy, хоткеи?')) post('/stopall');`">Стоп все задания</button>" +
+                $zooBtn +
+                "<button class='btn tool' onclick=`"post('/opensync');`">SyncDir</button>" +
+                "<button class='btn stop' onclick=`"if(confirm('Очистить очередь (локальный SyncDir)? Содержимое уедет в бэкап.')) post('/clearqueue');`">Очистить очередь</button>" +
+                "<button class='btn tool' onclick=`"post('/openlog');`">Журнал (окно)</button>" +
+                "<span id='note' class='sub'></span>" +
+                "</div>"
+
+            $machine = $env:COMPUTERNAME
+            # Макет — отдельный файл dashboard.html рядом со скриптом (правится
+            # без трогания кода); подстановка — {PLACEHOLDER}-поля.
+            $tplPath = Join-Path (Split-Path -Parent $PSCommandPath) "dashboard.html"
+            $html = if (Test-Path $tplPath) { Read-TextFile -Path $tplPath } else { "<html><body><h3>dashboard.html не найден рядом с $PSCommandPath</h3></body></html>" }
+            $html = $html.Replace("{MACHINE}", $machine).Replace("{STATUS}", $statusHtml).Replace("{REMOTE_CARD}", $remoteHtmlCard).Replace("{PROGRESS}", $progressHtml).Replace("{TOOLS}", $toolsHtml).Replace("{ROWS}", $rows.ToString())
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($html)
+            $resp.ContentType = "text/html; charset=utf-8"
+            $resp.ContentLength64 = $bytes.Length
+            $resp.OutputStream.Write($bytes, 0, $bytes.Length)
+            $resp.OutputStream.Close()
+        } catch {
+            try { $resp.OutputStream.Close() } catch {}
+        }
+    }
+}
+
 # ===== РАЗБОР АРГУМЕНТОВ И ДИСПЕТЧЕР =====
 $Action = $null
 $Paths  = @()
 foreach ($arg in $Targets) {
-    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend", "ClearDisk", "MarkDelete")) {
+    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend", "ClearDisk", "MarkDelete", "History", "Web")) {
         $Action = $arg
     } else {
         $Paths += $arg
@@ -1849,6 +2349,13 @@ elseif ($Action -eq "ClearDisk") {
 }
 elseif ($Action -eq "MarkDelete") {
     Invoke-MarkDelete
+}
+elseif ($Action -eq "History") {
+    Invoke-History
+    if ($Host.Name -eq "ConsoleHost") { Read-Host "Enter — закрыть" | Out-Null }
+}
+elseif ($Action -eq "Web") {
+    Invoke-WebStatus
 }
 elseif ($Paths.Count -gt 0) {
     Pack-Files -Paths $Paths
