@@ -210,6 +210,12 @@ $script:LastLocked = @{}
 # объекта: изменился файл (новое содержимое) — счётчик неудач сбрасывается.
 $script:SendFailures = @{}
 
+# Блок фоновых отправок служебных карточек (status-*/progress-*): после первой
+# же неудачи карточки не ретраятся вовсе. Разблокировка — при успешной реальной
+# передаче (канал жив). Иначе карточка, переписываемая heartbeat'ом каждые 30 сек
+# (новый sync-ключ), ретраится вечно и занимает буфер JSON-пакетом каждую минуту.
+$script:ServiceSendBlocked = $false
+
 # Старты приёма файлов (FileId -> время первого чанка) — для строки «ПРИНЯТО за N сек»
 $script:ReceiveStarts = @{}
 
@@ -950,7 +956,10 @@ function Wait-SyncAck {
     # Ждёт очистки буфера приёмником. При таймауте забирает свой пакет обратно,
     # чтобы Watch не завис навсегда (слушатель на другом конце может быть выключен).
     param([string]$RelPath)
-    $deadline = (Get-Date).AddSeconds($script:SyncAckTimeoutSec)
+    # Служебные карточки дашборда не должны держать буфер по минуте: не ответили
+    # за 5 сек — считаем канал недоступным (новая карточка придёт с heartbeat).
+    $ackTimeout = if ($RelPath -match '^(status|progress)-') { 5 } else { $script:SyncAckTimeoutSec }
+    $deadline = (Get-Date).AddSeconds($ackTimeout)
     while ($true) {
         Start-Sleep -Milliseconds $script:PollIntervalMs
         try {
@@ -960,7 +969,7 @@ function Wait-SyncAck {
         }
         if ((Get-Date) -gt $deadline) {
             try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
-            Write-Log "НЕ ПЕРЕДАНО: '$RelPath' — приёмник не отвечает (ждали $script:SyncAckTimeoutSec сек), повтор автоматически" "Yellow"
+            Write-Log "НЕ ПЕРЕДАНО: '$RelPath' — приёмник не отвечает (ждали $ackTimeout сек), повтор автоматически" "Yellow"
             Notify-WatchFailure
             return $false
         }
@@ -968,20 +977,27 @@ function Wait-SyncAck {
 }
 
 function Save-ClipText {
-    # Текст буфера перед отправкой пакета, чтобы вернуть его после попытки:
-    # пользователь не должен находить в буфере JSON вместо своего текста.
-    # (Только текст; скопированный в проводнике список файлов не сохраняем.)
+    # Текст и список файлов буфера перед отправкой пакета, чтобы вернуть их
+    # после попытки: пользователь не должен находить в буфере JSON вместо
+    # своего текста и терять скопированные в проводнике файлы.
     try {
-        if ([System.Windows.Forms.Clipboard]::ContainsText()) { return [System.Windows.Forms.Clipboard]::GetText() }
+        $saved = @{ Text = $null; Files = $null }
+        if ([System.Windows.Forms.Clipboard]::ContainsText()) { $saved.Text = [System.Windows.Forms.Clipboard]::GetText() }
+        if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { $saved.Files = [System.Windows.Forms.Clipboard]::GetFileDropList() }
+        if (-not $saved.Text -and -not $saved.Files) { return $null }
+        return $saved
     } catch {}
     return $null
 }
 
 function Restore-ClipText {
-    # Возврат пользовательского текста в буфер после отправки/неудачи.
-    param([string]$Text)
-    if ([string]::IsNullOrEmpty($Text)) { return }
-    try { [System.Windows.Forms.Clipboard]::SetText($Text) } catch {}
+    # Возврат содержимого буфера после отправки/неудачи: текст или файлы.
+    param($Saved)
+    if (-not $Saved) { return }
+    try {
+        if ($Saved.Text) { [void][System.Windows.Forms.Clipboard]::SetText($Saved.Text); return }
+        if ($Saved.Files -and $Saved.Files.Count -gt 0) { [void][System.Windows.Forms.Clipboard]::SetFileDropList($Saved.Files) }
+    } catch {}
 }
 
 function Test-SyncRetryReady {
@@ -1295,6 +1311,7 @@ function Scan-SyncDir {
         if ([string]::IsNullOrWhiteSpace($rel)) { continue }
         $key = Get-SyncKey -Item $file -RelPath $rel
         if ($script:ChangeLog.ContainsKey($key) -and $script:ChangeLog[$key] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { continue }
+        if ($script:ServiceSendBlocked -and $rel -match '^(status|progress)-') { continue }   # служебные — только после живого канала
         if (-not (Test-FileFree -Path $file.FullName)) { continue }   # занятые — в следующий скан
         $pendingFiles += [pscustomobject]@{ File = $file; Rel = $rel; Key = $key }
     }
@@ -1305,6 +1322,7 @@ function Scan-SyncDir {
             $zipItem = Get-Item $zipPath
             if (Send-SyncFile -File $zipItem -RelPath (Split-Path $zipPath -Leaf)) {
                 Clear-SyncFailure -RelPath ".syncbatch"
+                $script:ServiceSendBlocked = $false   # канал жив — карточки снова можно слать
                 # Содержимое помечаем SENT (архив доставлен), сам архив удаляем
                 foreach ($d in $pendingDirs) { Add-DirChangeEntry -Type "SENT" -RelPath $d }
                 foreach ($pf in $pendingFiles) { Add-ChangeEntry -Type "SENT" -RelPath $pf.Rel -Item $pf.File }
@@ -1330,6 +1348,7 @@ function Scan-SyncDir {
         if (-not (Test-SyncRetryReady -RelPath "dir:$rel" -SyncKey $dirKey)) { continue }
         if (Send-SyncDirectory -RelPath $rel) {
             Clear-SyncFailure -RelPath "dir:$rel"
+            $script:ServiceSendBlocked = $false
             Add-DirChangeEntry -Type "SENT" -RelPath $rel
         } else {
             Register-SyncFailure -RelPath "dir:$rel" -SyncKey $dirKey
@@ -1344,6 +1363,7 @@ function Scan-SyncDir {
     foreach ($file in $files) {
         $rel = Get-RelPath -FullName $file.FullName
         if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        if ($script:ServiceSendBlocked -and $rel -match '^(status|progress)-') { continue }   # служебные — только после живого канала
         $key = Get-SyncKey -Item $file -RelPath $rel
         if ($script:ChangeLog.ContainsKey($key) -and $script:ChangeLog[$key] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) {
             $handledCount++
@@ -1366,9 +1386,11 @@ function Scan-SyncDir {
         if (Send-SyncFile -File $file -RelPath $rel) {
             Clear-SyncFailure -RelPath $rel
             Add-ChangeEntry -Type "SENT" -RelPath $rel -Item $file
+            if ($rel -notmatch '^(status|progress)-') { $script:ServiceSendBlocked = $false }   # реальная передача прошла — канал жив
             $sentCount++
         } else {
             $failedCount++
+            if ($rel -match '^(status|progress)-') { $script:ServiceSendBlocked = $true }   # карточки не ретраим: уедут с реальной передачей
             Register-SyncFailure -RelPath $rel -SyncKey $key
         }
     }
