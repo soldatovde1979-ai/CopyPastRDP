@@ -77,7 +77,7 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <div class="panel">
 <div class="panel">
 <div class="phead"><b>Другой ПК</b> <span id="reminfo" class="sub"></span>
-<button class='btn tool' onclick="location.href='/refresh-remote'" title="Обновить список">&#8635;</button>
+<button class='btn tool' onclick="post('/refresh-remote')" title="Обновить список">&#8635;</button>
 <button class='btn tool' onclick="cmd('copy','rem')" title="Копировать отмеченное на этот ПК">Копировать</button>
 <button class='btn tool' onclick="cmd('move','rem')" title="Переместить: копия сюда, у другого ПК — удаление">Переместить</button>
 <button class='btn stop' onclick="cmd('del','rem')" title="Удалить отмеченное у другого ПК">Удалить</button>
@@ -99,6 +99,15 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 {SETTINGS}
 </div>
 <script>
+var TOKEN = '{TOKEN}';
+// Все запросы к API идут с токеном сеанса: сервер проверяет заголовок
+// X-CP-Token во всех запросах, кроме выдачи самой страницы (анти-CSRF)
+var _fetch = window.fetch;
+window.fetch = function(url, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers, {'X-CP-Token': TOKEN});
+  return _fetch(url, opts);
+};
 var uploading = false;
 // Живое обновление БЕЗ перезагрузки страницы: /state отдаёт только лог,
 // статусы и прогресс — командер не дёргается. Перезагрузка осталась только
@@ -203,10 +212,12 @@ function renderPanel(side, data){
   var dk = Object.keys(dirs).sort();
   dk.forEach(function(d){
     var r = document.createElement('div'); r.className='row dir';
-    r.innerHTML = "<span class='ic'>&#128193;</span><span class='nm'></span><span class='fav' title='В избранное'>&#9734;</span>";
+    r.innerHTML = "<input type='checkbox'><span class='ic'>&#128193;</span><span class='nm'></span><span class='fav' title='В избранное'>&#9734;</span>";
     r.querySelector('.nm').textContent = d;
     var fpath = cur ? cur+'/'+d : d;
     r.onclick = function(){ nav(side, fpath); };
+    var cb = r.querySelector('input'); cb.dataset.rel = fpath;
+    cb.addEventListener('click', function(e){ e.stopPropagation(); });
     r.querySelector('.fav').onclick = function(e){ e.stopPropagation(); addFav(side, fpath); };
     body.appendChild(r);
   });
@@ -238,21 +249,6 @@ function addFav(side, rel){
   setFav(f); renderAll();
 }
 function delFav(i){ var f = getFav(); f.splice(i, 1); setFav(f); renderAll(); }
-function renderFav(){
-  var body = document.getElementById('favbody');
-  var f = getFav();
-  body.innerHTML = '';
-  if (!f.length) { body.innerHTML = "<div class='sub' style='padding:6px'>Пусто — ⭐ у папки</div>"; return; }
-  f.forEach(function(x, i){
-    var r = document.createElement('div'); r.className='row file';
-    r.innerHTML = "<span class='ic'>" + (x.side === 'loc' ? '&#128421;' : '&#127760;') + "</span><span class='nm' style='cursor:pointer'></span><span class='sz' style='cursor:pointer'>&#10005;</span>";
-    r.querySelector('.nm').textContent = x.rel;
-    r.querySelector('.nm').title = x.rel + ' — ' + (x.side === 'loc' ? 'этот ПК' : 'другой ПК');
-    r.querySelector('.nm').onclick = function(){ setFolder(x.side, x.rel); renderAll(); };
-    r.querySelector('.sz').onclick = function(){ delFav(i); };
-    body.appendChild(r);
-  });
-}
 var LOC=null, REM=null, SYNCROOT='';
 // Родитель корня disk за пределами SyncDir: C:\CHANGE\disk -> C:/CHANGE
 function parentOfRoot(){
@@ -334,6 +330,7 @@ function uploadList(list){
       var xhr = new XMLHttpRequest();
       xhr.open('POST', immediate ? '/sendnow' : '/drop', true);
       xhr.setRequestHeader('Content-Type','application/json');
+      xhr.setRequestHeader('X-CP-Token', TOKEN);
       xhr.onload = xhr.onerror = function(){
         pending--;
         if (pending > 0) dz.innerHTML = 'Осталось ' + pending;
@@ -372,6 +369,15 @@ document.getElementById('pickdir').addEventListener('change', function(e){
     out.push({file:f, path: f.webkitRelativePath || f.name});
   });
   uploadList(out);
+});
+// Форма параметров: нативный сабмит не может передать заголовок — перехватываем
+// и шлём fetch'ем (токен добавит обёртка выше); FormData сохраняет и hidden,
+// и checkbox-поля формы (AutoUpdate/DiskSyncEnabled), порядок как у нативного сабмита
+var sf = document.getElementById('settingsform');
+if (sf) sf.addEventListener('submit', function(e){
+  e.preventDefault();
+  fetch('/settings', {method:'POST', body: new URLSearchParams(new FormData(sf)).toString()})
+    .then(function(){ location.reload(); });
 });
 loadPanels();
 </script></body></html>

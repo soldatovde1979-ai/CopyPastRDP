@@ -349,8 +349,6 @@ function Send-FileInChunks {
     $fileGuid = [guid]::NewGuid().ToString("N")
 
     # MD5 всего файла: приёмник сверяет собранный файл и отбраковывает битое
-    try { $fileHash = (Get-FileHash -LiteralPath $File.FullName -Algorithm MD5).Hash } catch { $fileHash = "" }
-
     $fileHash = ""
     try { $fileHash = (Get-FileHash -LiteralPath $File.FullName -Algorithm MD5).Hash } catch {}
 
@@ -1035,7 +1033,15 @@ function Wait-SyncAck {
             return $false
         }
         if ((Get-Date) -gt $deadline) {
-            try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
+            # Буфер священен: стираем только СВОЙ пакет (маркер внутри). Если
+            # пользователь за время ожидания успел что-то скопировать и пакет
+            # заменён его текстом — буфер не трогаем.
+            $clipOurs = $false
+            try {
+                $clipNow = if ([System.Windows.Forms.Clipboard]::ContainsText()) { [System.Windows.Forms.Clipboard]::GetText() } else { '' }
+                $clipOurs = ($clipNow -match '"Marker"\s*:\s*"(FILE_TRANSFER_DATA|FILE_CHUNK_DATA|FILE_DISK_CMD|FILE_DISK_DIR)"')
+                if ($clipOurs) { [System.Windows.Forms.Clipboard]::Clear() }
+            } catch {}
             # Лог и звук — не чаще раза в FailLogIntervalSec на путь: лежащая
             # удалёнка не должна заливать журнал и дёргать звуком каждый backoff
             $lastLog = $script:LastFailLog[$RelPath]
@@ -2043,7 +2049,7 @@ function Start-SendNow {
 }
 
 function Invoke-SendNow {
-    # FileTransfer.ps1 SendNow -FileList <файл со списком путей>
+    # FileTransfer.ps1 SendNow <файл со списком путей>
     # ПРЯМАЯ отправка файлов на другой ПК в обход disk: каждый файл уходит
     # чанками через буфер, приёмник кладёт его по [Routes] (папка назначения
     # по шаблону) или в InDir, если маски нет. Клик пользователя в командере —
@@ -2426,6 +2432,10 @@ function Get-WebStateHtml {
             $rel = (Get-RelPath -FullName $f.FullName).ToLowerInvariant()
             if (-not $marked[$rel]) { $queueCount++; $queueMB += $f.Length / 1MB }
         }
+        # Папки без отметки тоже в очереди (иначе карточка врёт «очередь пуста»)
+        foreach ($d in @(Get-ChildItem -Path $script:SyncDir -Directory -Recurse -ErrorAction SilentlyContinue)) {
+            if (-not $marked["dir/$((Get-RelPath -FullName $d.FullName).ToLowerInvariant())"]) { $queueCount++ }
+        }
     } catch {}
     $queueTxt = if ($queueCount -gt 0) { "очередь: <b>$queueCount</b> файл(ов), $([math]::Round($queueMB, 1)) МБ" } else { "очередь пуста" }
     $paused = Test-Path (Join-Path $script:SyncDir ".syncpause")
@@ -2521,11 +2531,23 @@ function Invoke-WebStatus {
         return
     }
     Write-Log "WEB: dashboard started at http://localhost:8123/" "Green"
+    # Токен сеанса дашборда: вшивается в HTML и проверяется во всех запросах,
+    # кроме выдачи самой страницы (защита от CSRF и DNS-rebinding)
+    $script:WebToken = [guid]::NewGuid().ToString("N")
     while ($listener.IsListening) {
         try { $ctx = $listener.GetContext() } catch { break }
         $resp = $ctx.Response
         try {
             $path = $ctx.Request.Url.AbsolutePath
+            # Все запросы, кроме выдачи самой страницы, требуют токен сеанса
+            # в заголовке X-CP-Token
+            if ($path -ne "/") {
+                if ([string]$ctx.Request.Headers["X-CP-Token"] -ne $script:WebToken) {
+                    $resp.StatusCode = 403
+                    $resp.OutputStream.Close()
+                    continue
+                }
+            }
             if ($path -eq "/copylog") {
                 # Текст последних N событий — удобно вставить в письмо или чат
                 $n = 10
@@ -2668,7 +2690,7 @@ function Invoke-WebStatus {
                             if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null }
                             $tmpPath = Join-Path $tmpDir "$safeName"
                             [System.IO.File]::WriteAllBytes($tmpPath, [Convert]::FromBase64String([string]$j.Data))
-                            $spawned = Start-SendNow -FileList @($tmpPath)
+                            $spawned = Start-SendNow -Files @($tmpPath)
                             if ($spawned) { Write-Log "SENDNOW: '$safeName' ($([math]::Round((Get-Item $tmpPath).Length / 1MB, 2)) МБ) — прямая отправка" "White" }
                         }
                         $resp.StatusCode = 200
@@ -2795,7 +2817,15 @@ function Invoke-WebStatus {
                         Add-ChangeEntry -Type "SENT" -RelPath $relQ -Item $fq
                         $cntQ++
                     }
-                    Write-Log "Web: очередь disk очищена - $cntQ файл(ов) помечено SENT, файлы остались на disk" "White"
+                    # Папки тоже помечаем: без этого слушатель вечно ретраит dir-записи
+                    foreach ($dq in @(Get-ChildItem -Path $script:SyncDir -Directory -Recurse -ErrorAction SilentlyContinue)) {
+                        $relDQ = Get-RelPath -FullName $dq.FullName
+                        if ([string]::IsNullOrWhiteSpace($relDQ)) { continue }
+                        if ($markedQ["dir/$($relDQ.ToLowerInvariant())"]) { continue }
+                        Add-DirChangeEntry -Type "SENT" -RelPath $relDQ
+                        $cntQ++
+                    }
+                    Write-Log "Web: очередь disk очищена - $cntQ файл(ов)/папок помечено SENT, файлы остались на disk" "White"
                 } elseif ($path -eq "/openlog") {
                     # Просмотр журнала: LogTracker.ps1, если рядом, иначе блокнот
                     $ltPath = Join-Path (Split-Path -Parent $PSCommandPath) "LogTracker.ps1"
@@ -2837,17 +2867,24 @@ function Invoke-WebStatus {
                                     Where-Object { $_.Name -notin @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' } |
                                     ForEach-Object { $rel = Get-RelPath -FullName $_.FullName; if (-not $marked3[$rel.ToLowerInvariant()]) { $_.FullName } })
                             } catch {}
-                            if ($all.Count -gt 0) { Start-SendNow -FileList $all }
+                            if ($all.Count -gt 0) { Start-SendNow -Files $all }
                             else { Write-Log "CMD: очередь пуста" "White" }
                         } elseif ($panel -eq 'loc' -and $op -eq 'copy') {
                             # Прямая отправка отмеченного мимо disk: приёмник разложит
                             # по [Routes] (папка назначения по шаблону) или в InDir.
                             # Абсолютные пути диска (навигация до C:\) уходят как есть.
+                            # Папки разворачиваются в файлы (SendNow принимает только
+                            # файлы); содержимое disk уедет с сохранением структуры.
                             $abs = @($paths | ForEach-Object {
                                 if ($_ -match '^[A-Za-z]:') { $_ -replace '/', '\' }
                                 else { Resolve-SyncPath -Rel $_ }
-                            } | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
-                            if (Start-SendNow -FileList $abs) { Write-Log "CMD: отправляется $($abs.Count) эл. (прямая отправка)" "White" }
+                            } | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+                                ForEach-Object {
+                                    if (Test-Path -LiteralPath $_ -PathType Container) {
+                                        Get-ChildItem -LiteralPath $_ -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+                                    } else { $_ }
+                                })
+                            if (Start-SendNow -Files $abs) { Write-Log "CMD: отправляется $($abs.Count) эл. (прямая отправка)" "White" }
                         } elseif ($panel -eq 'loc' -and $op -eq 'del') {
                             foreach ($rel in $paths) {
                                 if ($rel -match '^[A-Za-z]:') { Write-Log "CMD: '$rel' вне disk — удаление запрещено" "Yellow"; continue }
@@ -2866,13 +2903,14 @@ function Invoke-WebStatus {
                                 $isAbs = $rel -match '^[A-Za-z]:'
                                 $src = if ($isAbs) { $rel -replace '/', '\' } else { Resolve-SyncPath -Rel $_ }
                                 if (-not $src -or -not (Test-Path -LiteralPath $src)) { continue }
+                                if (Test-Path -LiteralPath $src -PathType Container) { Write-Log "CMD: '$rel' — папка; перемещение папок не поддерживается, используйте копирование" "Yellow"; continue }
                                 $stagedPath = Join-Path $stage (Split-Path -Leaf $src)
                                 Copy-Item -LiteralPath $src -Destination $stagedPath -Force
                                 $staged += $stagedPath
                                 if ($isAbs) { $hints += "" } else { $hints += $rel; $inside += $rel }
                             }
                             if ($staged.Count -gt 0) {
-                                [void](Start-SendNow -FileList $staged -RelHints $hints)
+                                [void](Start-SendNow -Files $staged -RelHints $hints)
                                 foreach ($rel in $inside) { Backup-SyncItem -Rel $rel }
                                 [void](Remove-ChangeEntries -RelPaths $inside)
                                 Write-Log "CMD: перемещается $($staged.Count) эл. (оригиналы - в бэкап TEMP)" "White"
@@ -2882,17 +2920,17 @@ function Invoke-WebStatus {
                             # приёмник снимет у себя отметки и отправит перечисленное.
                             # SendNow ускоряет доставку маркера (мимо сторожа простоя).
                             Set-Content -LiteralPath (Join-Path $script:SyncDir ".get") -Value ($paths -join "`r`n") -Encoding UTF8
-                            [void](Start-SendNow -FileList @((Join-Path $script:SyncDir ".get")))
+                            [void](Start-SendNow -Files @((Join-Path $script:SyncDir ".get")))
                             Write-Log "CMD: запрошено у другого ПК $($paths.Count) эл. (маркер .get)" "White"
                         } elseif ($panel -eq 'rem' -and $op -eq 'move') {
                             # Переместить: .mv у приёмника отправит перечисленное и удалит
                             # оригиналы после подтверждённой передачи (бэкап в TEMP)
                             Set-Content -LiteralPath (Join-Path $script:SyncDir ".mv") -Value ($paths -join "`r`n") -Encoding UTF8
-                            [void](Start-SendNow -FileList @((Join-Path $script:SyncDir ".mv")))
+                            [void](Start-SendNow -Files @((Join-Path $script:SyncDir ".mv")))
                             Write-Log "CMD: перемещение $($paths.Count) эл. у другого ПК (маркер .mv)" "White"
                         } elseif ($panel -eq 'rem' -and $op -eq 'del') {
                             Set-Content -LiteralPath (Join-Path $script:SyncDir ".rm") -Value ($paths -join "`r`n") -Encoding UTF8
-                            [void](Start-SendNow -FileList @((Join-Path $script:SyncDir ".rm")))
+                            [void](Start-SendNow -Files @((Join-Path $script:SyncDir ".rm")))
                             Write-Log "CMD: команда на удаление $($paths.Count) эл. у другого ПК (маркер .rm)" "White"
                         }
                     }
@@ -2957,7 +2995,7 @@ function Invoke-WebStatus {
                 }
             }
             $statusHtml = "<span id='stListen'>$($ws.Listen)</span><span class='sep'>|</span><span class='sub' id='stRemote'>$($ws.Remote)</span>" +
-                "<button class='btn tool' onclick=`"location.href='/refresh-remote';`">Обновить</button>" +
+                "<button class='btn tool' onclick=`"post('/refresh-remote');`">Обновить</button>" +
                 "<span class='sep'>|</span>" +
                 "<button class='btn tool' onclick=`"post('/terminal');`">Терминал</button>" +
                 "<span class='grp'><input id='copyn' type='number' value='10' min='1' max='200' class='num'>" +
@@ -2974,7 +3012,7 @@ function Invoke-WebStatus {
             $machine = $env:COMPUTERNAME
             # Форма параметров справа от лога: правки [Settings] в setcp.ini
             # с перезапуском слушателя (INI перечитывается только при старте)
-            $settingsHtml = "<div class='card' id='settings'><div class='st'>Параметры</div><form method='post' action='/settings'>" +
+            $settingsHtml = "<div class='card' id='settings'><div class='st'>Параметры</div><form id='settingsform' method='post' action='/settings'>" +
                 (Get-NumField 'SyncAckFastSec' 'Ожидание ACK, сек' 'сколько буфер занят пакетом' 3) +
                 (Get-NumField 'SyncIdleGuardSec' 'Покой перед отправкой, сек' 'фоновая синхр. ждёт простоя мыши/клавы' 4) +
                 (Get-NumField 'SyncRetryDelaySec' 'Первый повтор, сек' 'растёт вдвое с каждой неудачей' 600) +
@@ -2993,7 +3031,7 @@ function Invoke-WebStatus {
             # без трогания кода); подстановка — {PLACEHOLDER}-поля.
             $tplPath = Join-Path (Split-Path -Parent $PSCommandPath) "dashboard.html"
             $html = if (Test-Path $tplPath) { Read-TextFile -Path $tplPath } else { "<html><body><h3>dashboard.html не найден рядом с $PSCommandPath</h3></body></html>" }
-            $html = $html.Replace("{MACHINE}", $machine).Replace("{STATUS}", $statusHtml).Replace("{PROGRESS}", $progressHtml).Replace("{SETTINGS}", $settingsHtml).Replace("{ROWS}", $rows.ToString()).Replace("{QUEUE}", $ws.QueueFiles)
+            $html = $html.Replace("{MACHINE}", $machine).Replace("{STATUS}", $statusHtml).Replace("{PROGRESS}", $progressHtml).Replace("{SETTINGS}", $settingsHtml).Replace("{ROWS}", $rows.ToString()).Replace("{QUEUE}", $ws.QueueFiles).Replace("{TOKEN}", $script:WebToken)
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($html)
             $resp.ContentType = "text/html; charset=utf-8"
             $resp.ContentLength64 = $bytes.Length
