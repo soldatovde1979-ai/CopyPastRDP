@@ -209,6 +209,27 @@ try {
     Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось запустить СЛУШАТЕЛЯ - $($_.Exception.Message)" "Yellow"
 }
 
+# ===== 5.1 Перезапуск веб-дашборда =====
+# Web-процесс живёт отдельно от Watch и держит порт 8123 со СТАРЫМ кодом,
+# поэтому после установки его тоже перезапускаем.
+$webProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*FileTransfer.ps1*Web*" -and $_.ProcessId -ne $PID })
+foreach ($proc in $webProcesses) {
+    try {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        Write-Step "Остановлен старый дашборд Web (PID $($proc.ProcessId))" "Yellow"
+    } catch { }
+}
+Start-Sleep -Milliseconds 500
+try {
+    $webProcess = Start-Process -FilePath $PowerShellExe `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$targetScript`" Web" `
+        -WorkingDirectory $Destination -PassThru
+    Write-Step "Дашборд перезапущен (PID $($webProcess.Id)) — http://localhost:8123" "Green"
+} catch {
+    Write-Step "ПРЕДУПРЕЖДЕНИЕ: не удалось запустить дашборд Web - $($_.Exception.Message)" "Yellow"
+}
+
 # ===== 6. Распространение обновлений на другой контур через SyncDir =====
 # В SyncDir уходят ТОЛЬКО общие файлы FileTransfer.ps1 и setcp.ini.
 # setcp.local.ini НЕ копируется: локальные настройки контура (например, keep-alive)

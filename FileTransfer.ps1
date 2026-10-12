@@ -130,6 +130,26 @@ $script:ClipRetryAttempts      = [int](Get-IniValue    -Section "Settings" -Key 
 $script:ClipRetryDelayMs       = [int](Get-IniValue    -Section "Settings" -Key "ClipRetryDelayMs"  -Default "300")
 $script:RoutesEnabled          = Get-IniBool -Section "Settings" -Key "RoutesEnabled"          -Default $true
 $script:RoutesOverrideUnpackTo = Get-IniBool -Section "Settings" -Key "RoutesOverrideUnpackTo" -Default $true
+# Детект простоя пользователя (клава/мышь): фоновая синхронизация не должна
+# отбирать буфер во время работы. GetLastInputInfo — время с последнего ввода.
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class IdleDetector {
+  [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+  public static uint IdleSeconds() {
+    LASTINPUTINFO li = new LASTINPUTINFO();
+    li.cbSize = (uint)Marshal.SizeOf(li);
+    if (!GetLastInputInfo(ref li)) return 0;
+    return (uint)Environment.TickCount >= li.dwTime ? ((uint)Environment.TickCount - li.dwTime) / 1000u : 0u;
+  }
+}
+"@ -ErrorAction SilentlyContinue
+function Get-UserIdleSeconds {
+    # Секунды с последнего ввода (клава/мышь). При ошибке — 9999 (fail-open:
+    # синхронизация продолжает работать, если детект не взведён).
+    try { return [int][IdleDetector]::IdleSeconds() } catch { return 9999 }
+}
 
 # Синхронизация папки между контурами и сохранение сеанса (работают в режиме Watch)
 $script:DiskSyncEnabled   = Get-IniBool -Section "Settings" -Key "DiskSyncEnabled"   -Default $false
@@ -137,9 +157,15 @@ $script:SyncPollMs        = [int](Get-IniValue -Section "Settings" -Key "SyncPol
 $script:SyncAckTimeoutSec = [int](Get-IniValue -Section "Settings" -Key "SyncAckTimeoutSec" -Default "60")
 # Backoff после неудачной отправки (слушатель другого контура выключен): пауза
 # перед повтором растёт вдвое с каждой попыткой до SyncRetryMaxDelaySec.
-# Без этого файл ретраится каждым сканом, а буфер обмена постоянно забивается пакетами.
-$script:SyncRetryDelaySec    = [int](Get-IniValue -Section "Settings" -Key "SyncRetryDelaySec"    -Default "60")
-$script:SyncRetryMaxDelaySec = [int](Get-IniValue -Section "Settings" -Key "SyncRetryMaxDelaySec" -Default "1800")
+# По умолчанию 10 мин -> 1 час: канал либо жив, либо дёргать его чаще незачем.
+$script:SyncRetryDelaySec    = [int](Get-IniValue -Section "Settings" -Key "SyncRetryDelaySec"    -Default "600")
+$script:SyncRetryMaxDelaySec = [int](Get-IniValue -Section "Settings" -Key "SyncRetryMaxDelaySec" -Default "3600")
+# Сторож простоя: фоновая синхронизация не трогает буфер, пока пользователь
+# работает (нет клавише/мыши меньше SyncIdleGuardSec секунд). 0 — выключить.
+$script:SyncIdleGuardSec = [int](Get-IniValue -Section "Settings" -Key "SyncIdleGuardSec" -Default "4")
+# Быстрый ACK фоновой синхронизации: живой приёмник забирает чанк за 1-3 сек.
+# Не забрал — канал недоступен: буфер возвращается сразу, повтор по backoff.
+$script:SyncAckFastSec = [int](Get-IniValue -Section "Settings" -Key "SyncAckFastSec" -Default "3")
 # Пакетная отправка: если в очереди синхронизации столько НОВЫХ элементов (файлов
 # + папок), они отправляются одним ZIP-архивом вместо тысяч отдельных пакетов.
 $script:SyncBatchFiles = [int](Get-IniValue -Section "Settings" -Key "SyncBatchFiles" -Default "50")
@@ -215,6 +241,11 @@ $script:SendFailures = @{}
 # передаче (канал жив). Иначе карточка, переписываемая heartbeat'ом каждые 30 сек
 # (новый sync-ключ), ретраится вечно и занимает буфер JSON-пакетом каждую минуту.
 $script:ServiceSendBlocked = $false
+
+# Разговоживание строк «НЕ ПЕРЕДАНО»: один и тот же путь логируется не чаще
+# раза в FailLogIntervalSec — иначе лежащая удалёнка заливает журнал каждый backoff.
+$script:LastFailLog = @{}
+$script:FailLogIntervalSec = 600
 
 # Старты приёма файлов (FileId -> время первого чанка) — для строки «ПРИНЯТО за N сек»
 $script:ReceiveStarts = @{}
@@ -382,7 +413,17 @@ function Send-FileInChunks {
             Write-Log "   -> Chunk $chunkIndex/$totalChunks sent. Waiting for ACK..." "Gray"
 
             if ($SyncMode) {
-                if (-not (Wait-SyncAck -RelPath $RelPath)) {
+                # Пользователь вернулся к работе посреди отправки — снимаемся:
+                # буфер важнее; недоотправленный файл уедет в следующее окно простоя
+                if ($script:SyncIdleGuardSec -gt 0 -and (Get-UserIdleSeconds) -lt $script:SyncIdleGuardSec) {
+                    Write-Log "SYNC: '$RelPath' отложено — пользователь вернулся к работе" "DarkGray"
+                    Write-Progress -Activity $script:ProgressActivity -Completed -ErrorAction SilentlyContinue
+                    Clear-ProgressState
+                    try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
+                    Restore-ClipText $savedClip
+                    return $false
+                }
+                if (-not (Wait-SyncAck -RelPath $RelPath -TimeoutSec $script:SyncAckFastSec)) {
                     Write-Progress -Activity $script:ProgressActivity -Completed -ErrorAction SilentlyContinue
                     Clear-ProgressState
                     Notify-WatchFailure
@@ -955,10 +996,10 @@ function Initialize-ChangeLog {
 function Wait-SyncAck {
     # Ждёт очистки буфера приёмником. При таймауте забирает свой пакет обратно,
     # чтобы Watch не завис навсегда (слушатель на другом конце может быть выключен).
-    param([string]$RelPath)
-    # Служебные карточки дашборда не должны держать буфер по минуте: не ответили
-    # за 5 сек — считаем канал недоступным (новая карточка придёт с heartbeat).
-    $ackTimeout = if ($RelPath -match '^(status|progress)-') { 5 } else { $script:SyncAckTimeoutSec }
+    param([string]$RelPath, [int]$TimeoutSec = 0)
+    # Ждём приёмника не дольше SyncAckFastSec: живой приёмник забирает чанк за
+    # 1-3 сек; дольше ждать — держать буфер занятым JSON-пакетом без пользы.
+    $ackTimeout = if ($TimeoutSec -gt 0) { $TimeoutSec } else { $script:SyncAckFastSec }
     $deadline = (Get-Date).AddSeconds($ackTimeout)
     while ($true) {
         Start-Sleep -Milliseconds $script:PollIntervalMs
@@ -969,8 +1010,14 @@ function Wait-SyncAck {
         }
         if ((Get-Date) -gt $deadline) {
             try { [System.Windows.Forms.Clipboard]::Clear() } catch {}
-            Write-Log "НЕ ПЕРЕДАНО: '$RelPath' — приёмник не отвечает (ждали $ackTimeout сек), повтор автоматически" "Yellow"
-            Notify-WatchFailure
+            # Лог и звук — не чаще раза в FailLogIntervalSec на путь: лежащая
+            # удалёнка не должна заливать журнал и дёргать звуком каждый backoff
+            $lastLog = $script:LastFailLog[$RelPath]
+            if (-not $lastLog -or ((Get-Date) - $lastLog).TotalSeconds -gt $script:FailLogIntervalSec) {
+                Write-Log "НЕ ПЕРЕДАНО: '$RelPath' — приёмник не отвечает (ждали $ackTimeout сек), повтор по расписанию backoff" "Yellow"
+                $script:LastFailLog[$RelPath] = Get-Date
+                Notify-WatchFailure
+            }
             return $false
         }
     }
@@ -1247,6 +1294,14 @@ function Scan-SyncDir {
         return
     }
 
+    # Пауза фоновой синхронизации кнопкой дашборда (флаг-файл .syncpause)
+    if (Test-Path -LiteralPath (Join-Path $script:SyncDir ".syncpause") -PathType Leaf) { return }
+
+    # Сторож простоя: пока пользователь работает (клава/мышь), фоновая
+    # синхронизация не пишет пакеты в буфер вообще. Ручные отправки
+    # (Pack/PackAuto — SyncMode выключен) не затрагиваются.
+    if ($script:SyncIdleGuardSec -gt 0 -and (Get-UserIdleSeconds) -lt $script:SyncIdleGuardSec) { return }
+
     # Маркер удаления: файл .del в КОРНЕ SyncDir -> очистка ВСЕЙ папки на обоих контурах.
     # Маркер синхронизируется как обычный файл: сначала он отправляется на другой
     # контур (существующим чанковым механизмом), и только после подтверждения
@@ -1291,7 +1346,7 @@ function Scan-SyncDir {
     # Служебные файлы не отправляются: сам журнал change.log, маркер удаления .del,
     # незавершённые сборки .part и пакетные архивы .synczip (отправляются отдельно)
     $files       = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ine 'change.log' -and $_.Name -ine '.del' -and $_.Extension -ne '.part' -and $_.Extension -ne '.synczip' })
+        Where-Object { $_.Name -ine 'change.log' -and $_.Name -ine '.del' -and $_.Name -ine '.syncpause' -and $_.Extension -ne '.part' -and $_.Extension -ne '.synczip' })
 
     # Папки и файлы к отправке (сначала сбор_pending, затем решение: batch или по одному)
     $dirs = @(Get-ChildItem -Path $script:SyncDir -Directory -Recurse -ErrorAction SilentlyContinue)
@@ -2049,6 +2104,33 @@ function Invoke-History {
     Write-Host "================ журнал: $LOG_FILE ================" -ForegroundColor Cyan
 }
 
+function Update-IniSettings {
+    # Точечная правка ключей [Settings] в setcp.ini с сохранением комментариев:
+    # существующий ключ перезаписывается, нового — добавляется после [Settings].
+    param([string]$Path, [hashtable]$Values)
+    $lines = [System.Collections.Generic.List[string]]@(Get-Content -LiteralPath $Path -Encoding UTF8)
+    foreach ($k in $Values.Keys) {
+        $idx = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*' + [regex]::Escape($k) + '\s*=') { $idx = $i; break }
+        }
+        if ($idx -ge 0) { $lines[$idx] = "$k=$($Values[$k])" }
+        else {
+            $sIdx = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[Settings\]\s*$') { $sIdx = $i; break } }
+            if ($sIdx -ge 0) { $lines.Insert($sIdx + 1, "$k=$($Values[$k])") } else { $lines.Add("$k=$($Values[$k])") }
+        }
+    }
+    Set-Content -LiteralPath $Path -Value $lines -Encoding UTF8
+}
+
+function Get-NumField {
+    # Поле формы параметров: текущее значение ключа из setcp.ini + подпись
+    param([string]$Key, [string]$Label, [string]$Hint, [string]$Def)
+    $cur = Get-IniValue -Section "Settings" -Key $Key -Default $Def
+    return "<label><span class='pname'>$Label</span><input name='$Key' type='number' value='$cur'><span class='phint'>$Hint</span></label>"
+}
+
 function Get-DashboardState {
     # Общий срез для дашборда и кнопки «Скопировать»: события локального
     # журнала + события другого контура из status-*.json, свежие сверху.
@@ -2139,9 +2221,17 @@ function Invoke-WebStatus {
                         $j = $body | ConvertFrom-Json
                         $safeName = [System.IO.Path]::GetFileName([string]$j.Name)
                         if ($safeName) {
+                            # Относительный путь для файлов из папок (drop-зона с папками):
+                            # '..' и абсолютные пути запрещены — пишем только внутрь SyncDir
+                            $rel = ""
+                            if ($j.Path) { $rel = ([string]$j.Path -replace '\\', '/').Trim('/') }
+                            if ($rel -match '(\.\.|^[A-Za-z]:)') { $rel = "" }
+                            $target = if ($rel) { Join-Path $script:SyncDir ($rel -replace '/', '\') } else { Join-Path $script:SyncDir $safeName }
+                            $targetDir = Split-Path -Parent $target
+                            if ($targetDir -and -not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
                             $bytes = [Convert]::FromBase64String([string]$j.Data)
-                            [System.IO.File]::WriteAllBytes((Join-Path $script:SyncDir $safeName), $bytes)
-                            Write-Log "DROP: '$safeName' ($([math]::Round($bytes.Length / 1MB, 2)) МБ) добавлен в SyncDir" "Green"
+                            [System.IO.File]::WriteAllBytes($target, $bytes)
+                            Write-Log "DROP: '$rel$safeName' ($([math]::Round($bytes.Length / 1MB, 2)) МБ) добавлен в SyncDir" "Green"
                         }
                         $resp.StatusCode = 200
                         $b = [System.Text.Encoding]::UTF8.GetBytes("ok")
@@ -2215,6 +2305,40 @@ function Invoke-WebStatus {
                     } else {
                         Start-Process -FilePath "notepad.exe" -ArgumentList "`"$LOG_FILE`""
                     }
+                } elseif ($path -eq "/syncpause") {
+                    # Пауза фоновой синхронизации: флаг-файл .syncpause в SyncDir
+                    # (Scan-SyncDir при виде флага сразу выходит, ничего не отправляя)
+                    $flag = Join-Path $script:SyncDir ".syncpause"
+                    if (Test-Path $flag) { Remove-Item $flag -Force } else { Set-Content -LiteralPath $flag -Value "" -Encoding ASCII }
+                } elseif ($path -eq "/settings") {
+                    # Сохранение параметров [Settings] в setcp.ini + перезапуск слушателя
+                    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [System.Text.Encoding]::UTF8)
+                    $body = $reader.ReadToEnd(); $reader.Close()
+                    $vals = @{}
+                    foreach ($pair in ($body -split '&')) {
+                        $kv = $pair -split '=', 2
+                        if ($kv.Count -ne 2) { continue }
+                        $key = [System.Net.WebUtility]::UrlDecode($kv[0])
+                        $val = [System.Net.WebUtility]::UrlDecode($kv[1])
+                        if ($key -in @('SyncAckFastSec','SyncIdleGuardSec','SyncRetryDelaySec','SyncRetryMaxDelaySec','SyncPollMs','SyncBatchFiles','KeepAliveMinutes','SyncAckTimeoutSec','Debug')) {
+                            $n = 0; if ([int]::TryParse($val, [ref]$n)) { $vals[$key] = $n }
+                        } elseif ($key -in @('AutoUpdate','DiskSyncEnabled')) {
+                            $vals[$key] = if ($val -in @('on','1','true')) { 1 } else { 0 }
+                        }
+                    }
+                    if ($vals.Count -gt 0) {
+                        $iniPath = Join-Path (Split-Path -Parent $PSCommandPath) "setcp.ini"
+                        Update-IniSettings -Path $iniPath -Values $vals
+                        # Слушатель перечитывает INI только при старте — рестартуем
+                        Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+                            Where-Object { $_.CommandLine -like "*-File*FileTransfer.ps1*Watch*" } |
+                            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                        Start-Sleep -Milliseconds 500
+                        Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+                            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" Watch" `
+                            -WorkingDirectory (Split-Path -Parent $PSCommandPath)
+                        Write-Log "WEB: параметры сохранены ($($vals.Keys -join ', ')), слушатель перезапущен" "Cyan"
+                    }
                 }
                 $resp.StatusCode = 302
                 $resp.Headers["Location"] = "/"
@@ -2254,10 +2378,33 @@ function Invoke-WebStatus {
             $watchProcs = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
                 Where-Object { $_.CommandLine -like "*-File*FileTransfer.ps1*Watch*" })
             $running = $watchProcs.Count -gt 0
-            $statusHtml = if ($running) {
-                "<span class='st on'>&#9679; Слушатель работает</span> <form method='post' action='/stop' style='display:inline' onsubmit=`"return confirm('Остановить слушателя?')`"><button class='btn stop'>Остановить</button></form>"
+            # Очередь disk: файлы без отметки SENT/RECEIVED/SNAPSHOT в change.log
+            $queueCount = 0
+            $queueMB = 0.0
+            try {
+                $marked = @{}
+                Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+                    $p = $_ -split '\|', 3
+                    if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked[$p[2].ToLowerInvariant()] = $true }
+                }
+                foreach ($f in @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
+                    $rel = (Get-RelPath -FullName $f.FullName).ToLowerInvariant()
+                    if (-not $marked[$rel]) { $queueCount++; $queueMB += $f.Length / 1MB }
+                }
+            } catch {}
+            $queueTxt = if ($queueCount -gt 0) { "очередь: <b>$queueCount</b> файл(ов), $([math]::Round($queueMB, 1)) МБ" } else { "очередь пуста" }
+            $paused = Test-Path (Join-Path $script:SyncDir ".syncpause")
+            $pauseBtn = if ($paused) {
+                "<button class='btn tool' onclick=`"post('/syncpause');`">Возобновить синхр.</button>"
             } else {
-                "<span class='st off'>&#9679; Слушатель ОСТАНОВЛЕН</span> <form method='post' action='/start' style='display:inline'><button class='btn start'>Запустить</button></form>"
+                "<button class='btn tool warn' onclick=`"post('/syncpause');`">Пауза синхр.</button>"
+            }
+            $statusHtml = if ($running) {
+                "<span class='st on'>&#9679; Слушатель работает</span> <span class='sub'>· $queueTxt$(if ($paused) { ' · <b style=''color:#e8c268''>фоновая синхр. на паузе</b>' })</span>" +
+                " <form method='post' action='/stop' style='display:inline' onsubmit=`"return confirm('Остановить слушателя?')`"><button class='btn stop'>Остановить</button></form> $pauseBtn"
+            } else {
+                "<span class='st off'>&#9679; Слушатель ОСТАНОВЛЕН</span> <span class='sub'>· $queueTxt</span> <form method='post' action='/start' style='display:inline'><button class='btn start'>Запустить</button></form> $pauseBtn"
             }
             $remoteHtmlCard = if ($dash.RemoteName) {
                 $stateTxt = if ($dash.RemoteAge -lt 120) { "<span class='on'>&#9679; на связи</span>" } else { "<span class='off'>&#9679; молчит > 2 мин</span>" }
@@ -2294,11 +2441,28 @@ function Invoke-WebStatus {
                 "</div>"
 
             $machine = $env:COMPUTERNAME
+            # Форма параметров справа от лога: правки [Settings] в setcp.ini
+            # с перезапуском слушателя (INI перечитывается только при старте)
+            $settingsHtml = "<div class='card' id='settings'><div class='st'>Параметры</div><form method='post' action='/settings'>" +
+                (Get-NumField 'SyncAckFastSec' 'Ожидание ACK, сек' 'сколько буфер занят пакетом' 3) +
+                (Get-NumField 'SyncIdleGuardSec' 'Покой перед отправкой, сек' 'фоновая синхр. ждёт простоя мыши/клавы' 4) +
+                (Get-NumField 'SyncRetryDelaySec' 'Первый повтор, сек' 'растёт вдвое с каждой неудачей' 600) +
+                (Get-NumField 'SyncRetryMaxDelaySec' 'Макс. повтор, сек' 'потолок backoff' 3600) +
+                (Get-NumField 'SyncAckTimeoutSec' 'ACK ручной отправки, сек' 'только для SEND FILE' 60) +
+                (Get-NumField 'SyncPollMs' 'Опрос, мс' 'частота скана очереди' 1000) +
+                (Get-NumField 'SyncBatchFiles' 'Batch от N файлов' 'одним ZIP вместо пакетов' 50) +
+                (Get-NumField 'KeepAliveMinutes' 'KeepAlive, мин' '0 — выключен' 0) +
+                "<label><span class='pname'>Debug-лог</span><select name='Debug'><option value='0'$(if ((Get-IniValue -Section 'Settings' -Key 'Debug' -Default '0') -eq '0') { ' selected' })>только итоги</option><option value='1'$(if ((Get-IniValue -Section 'Settings' -Key 'Debug' -Default '0') -eq '1') { ' selected' })>полный</option></select></label>" +
+                "<label><span class='pname'>AutoUpdate</span><input type='hidden' name='AutoUpdate' value='0'><input type='checkbox' name='AutoUpdate' value='on'$(if ((Get-IniBool -Section 'Settings' -Key 'AutoUpdate' -Default $true)) { ' checked' })></label>" +
+                "<label><span class='pname'>Синхронизация disk</span><input type='hidden' name='DiskSyncEnabled' value='0'><input type='checkbox' name='DiskSyncEnabled' value='on'$(if ((Get-IniBool -Section 'Settings' -Key 'DiskSyncEnabled' -Default $false)) { ' checked' })></label>" +
+                "<button class='btn start' style='margin-left:0;margin-top:8px'>Сохранить и перезапустить</button>" +
+                "</form><div class='sub'>Пишется setcp.ini (C:\CHANGE) и уходит на другой контур</div></div>"
+
             # Макет — отдельный файл dashboard.html рядом со скриптом (правится
             # без трогания кода); подстановка — {PLACEHOLDER}-поля.
             $tplPath = Join-Path (Split-Path -Parent $PSCommandPath) "dashboard.html"
             $html = if (Test-Path $tplPath) { Read-TextFile -Path $tplPath } else { "<html><body><h3>dashboard.html не найден рядом с $PSCommandPath</h3></body></html>" }
-            $html = $html.Replace("{MACHINE}", $machine).Replace("{STATUS}", $statusHtml).Replace("{REMOTE_CARD}", $remoteHtmlCard).Replace("{PROGRESS}", $progressHtml).Replace("{TOOLS}", $toolsHtml).Replace("{ROWS}", $rows.ToString())
+            $html = $html.Replace("{MACHINE}", $machine).Replace("{STATUS}", $statusHtml).Replace("{REMOTE_CARD}", $remoteHtmlCard).Replace("{PROGRESS}", $progressHtml).Replace("{TOOLS}", $toolsHtml).Replace("{SETTINGS}", $settingsHtml).Replace("{ROWS}", $rows.ToString())
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($html)
             $resp.ContentType = "text/html; charset=utf-8"
             $resp.ContentLength64 = $bytes.Length

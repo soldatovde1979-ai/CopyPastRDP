@@ -14,7 +14,14 @@ h1{font-size:20px;margin:14px 0 12px}
 .toolbar .grp{display:inline-flex;align-items:center;gap:6px;margin-left:4px}
 .toolbar .num{width:52px;background:#171a21;border:1px solid #3a4356;border-radius:6px;color:#dfe3ea;padding:6px;font-size:13px}
 .toolbar #note{margin-left:10px}
-.logwrap{flex:1;overflow-y:auto;background:#232833;border-radius:10px;padding:6px 18px 14px;margin-bottom:16px}
+/* Две колонки: слева лог, справа форма параметров */
+.cols{flex:1;display:flex;gap:14px;min-height:0;margin-bottom:16px}
+.logwrap{flex:1 1 62%;overflow-y:auto;background:#232833;border-radius:10px;padding:6px 18px 14px;margin-bottom:0}
+#settings{flex:0 0 300px;overflow-y:auto;margin-bottom:0}
+#settings label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:7px 0}
+#settings .pname{color:#9aa3b2;font-size:12px}
+#settings .phint{color:#5a6373;font-size:10px;display:block;width:100%}
+#settings input[type=number],#settings select{width:90px;background:#171a21;border:1px solid #3a4356;border-radius:6px;color:#dfe3ea;padding:5px;font-size:12px}
 table{border-collapse:collapse;width:100%}td{padding:3px 8px;border-bottom:1px solid #262b35;font-size:13px;vertical-align:top}
 th{text-align:left;color:#8a93a5;font-size:12px;padding:6px 8px;position:sticky;top:0;background:#232833}
 td:first-child{white-space:nowrap;color:#8a93a5}
@@ -35,12 +42,20 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 {TOOLS}
 {REMOTE_CARD}
 {PROGRESS}
-<div class="card" id="drop">&#128230; Перетащите сюда файлы — уйдут на другой ПК<br><span style="font-size:11px">крупные файлы и папки — лучше архивом (7z/zip)</span></div>
+<div class="card" id="drop">&#128230; Перетащите сюда файлы или папки — уйдут на другой ПК
+<input type="file" id="pickfiles" multiple style="display:none">
+<input type="file" id="pickdir" webkitdirectory multiple style="display:none">
+<br><button class="btn tool" style="margin-top:8px" onclick="document.getElementById('pickfiles').click()">Выбрать файлы</button>
+<button class="btn tool" style="margin-top:8px" onclick="document.getElementById('pickdir').click()">Выбрать папку</button>
+<br><span style="font-size:11px">пустые папки не переносятся; крупные файлы — лучше архивом (7z/zip)</span></div>
 </div>
+<div class="cols">
 <div class="logwrap"><table>
 <tr><th>Время</th><th>Событие</th></tr>
 {ROWS}
 </table></div>
+{SETTINGS}
+</div>
 <script>
 var uploading = false;
 // Автообновление без meta refresh: на время загрузки файлов пауза,
@@ -59,45 +74,74 @@ function copyLog(){
     }
   });
 }
+// Сбор файлов из drag&drop (в т.ч. папок) через webkitGetAsEntry
+function walkEntry(entry, base, out, done){
+  if (entry.isFile) {
+    entry.file(function(f){ out.push({file:f, path: base + f.name}); done(); }, done);
+  } else if (entry.isDirectory) {
+    var rd = entry.createReader();
+    (function readNext(){
+      rd.readEntries(function(entries){
+        if (!entries.length) return done();
+        var n = entries.length;
+        entries.forEach(function(e){ walkEntry(e, base + entry.name + '/', out, function(){ if (--n === 0) done(); }); });
+        readNext();
+      }, done);
+    })();
+  } else done();
+}
+function uploadList(list){
+  if (!list.length) return;
+  uploading = true;
+  var dz = document.getElementById('drop');
+  var pending = list.length;
+  dz.innerHTML = 'Передача в SyncDir... ' + pending + ' файл(ов)';
+  list.forEach(function(item){
+    var r = new FileReader();
+    r.onload = function(){
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/drop', true);
+      xhr.setRequestHeader('Content-Type','application/json');
+      xhr.onload = xhr.onerror = function(){
+        pending--;
+        if (xhr.status && xhr.status !== 200) note('ОШИБКА ' + item.path + ': HTTP ' + xhr.status);
+        if (pending > 0) dz.innerHTML = 'Передача в SyncDir... осталось ' + pending;
+        else { uploading = false; location.reload(); }
+      };
+      xhr.send(JSON.stringify({name: item.file.name, path: item.path, data: r.result.split(',')[1]}));
+    };
+    r.readAsDataURL(item.file);
+  });
+}
 var dz = document.getElementById('drop');
-var dzHint = dz.innerHTML;
 dz.addEventListener('dragover', function(e){e.preventDefault(); dz.classList.add('over')});
 dz.addEventListener('dragleave', function(e){dz.classList.remove('over')});
 dz.addEventListener('drop', function(e){
   e.preventDefault(); dz.classList.remove('over');
+  var items = e.dataTransfer.items;
   var files = e.dataTransfer.files;
-  if (!files.length) return;
-  uploading = true;
-  var pending = files.length;
-  dz.innerHTML = 'Передача в SyncDir... ' + pending + ' файл(ов)';
-  for (var i = 0; i < files.length; i++) {
-    (function(f){
-      var r = new FileReader();
-      r.onload = function(){
-        var b64 = r.result.split(',')[1];
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/drop', true);
-        xhr.setRequestHeader('Content-Type','application/json');
-        xhr.onload = function(){
-          pending--;
-          if (xhr.status !== 200) {
-            note('ОШИБКА загрузки ' + f.name + ' (HTTP ' + xhr.status + '): ' + xhr.responseText);
-            dz.innerHTML = 'Не удалось: ' + f.name + '<br>' + dzHintSafe();
-          } else if (pending > 0) {
-            dz.innerHTML = 'Передача в SyncDir... осталось ' + pending;
-          }
-          if (pending <= 0) { uploading = false; location.reload(); }
-        };
-        xhr.onerror = function(){
-          pending--;
-          note('ОШИБКА сети при загрузке ' + f.name);
-          if (pending <= 0) { uploading = false; dz.innerHTML = dzHintSafe(); }
-        };
-        xhr.send(JSON.stringify({name: f.name, data: b64}));
-      };
-      r.readAsDataURL(f);
-    })(files[i]);
+  if (files.length && (!items || !items.length)) uploadList(Array.prototype.map.call(files, function(f){ return {file:f, path:f.name}; }));
+  else if (items.length) {
+    var out = [], entries = [], n = items.length;
+    for (var i = 0; i < n; i++) {
+      (function(it){
+        var e = it.webkitGetAsEntry && it.webkitGetAsEntry();
+        if (e) walkEntry(e, '', out, function(){ if (--n === 0) uploadList(out); });
+        else if (--n === 0) uploadList(out);
+      })(items[i]);
+    }
   }
 });
-function dzHintSafe(){ return dzHint = 'Ошибка загрузки — см. сообщение выше. <a href="#" onclick="location.reload();return false">Обновить</a>'; }
+document.getElementById('pickfiles').addEventListener('change', function(e){
+  uploadList(Array.prototype.map.call(e.target.files, function(f){ return {file:f, path:f.name}; }));
+});
+document.getElementById('pickdir').addEventListener('change', function(e){
+  var base = null, out = [];
+  Array.prototype.forEach.call(e.target.files, function(f){
+    var rp = f.webkitRelativePath || f.name;
+    if (base === null) base = rp.split('/')[0] + '/';
+    out.push({file:f, path: rp});
+  });
+  uploadList(out);
+});
 </script></body></html>
