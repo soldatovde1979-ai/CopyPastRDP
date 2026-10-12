@@ -527,6 +527,9 @@ function Pack-Files {
         }
 
         $i = 0
+        # Удаляются из OUT только реально упакованные файлы: непрочитанный
+        # (занятый) файл иначе исчез бы из OUT, так и не уйдя в буфер.
+        $packed = @()
         foreach ($f in $files) {
             $i++
             Write-Log "  [$i/$($files.Count)] $($f.Name) ($([math]::Round($f.Length/1KB,1)) KB)" "Gray"
@@ -536,6 +539,7 @@ function Pack-Files {
                 $md5 = [System.Security.Cryptography.MD5]::Create()
                 try { $hash = [BitConverter]::ToString($md5.ComputeHash($bytes)).Replace('-', '') } finally { $md5.Dispose() }
                 $data.Files += @{ Name = $f.Name; Content = [Convert]::ToBase64String($bytes); Hash = $hash }
+                $packed += $f
             } catch {
                 Write-Log "  FAIL: $($f.Name) - $($_.Exception.Message)" "Red"
                 $script:HasError = $true
@@ -560,10 +564,10 @@ function Pack-Files {
         }
 
         if ($clipOk) {
-            foreach ($f in $files) {
+            foreach ($f in $packed) {
                 if ($f.Directory.FullName -ieq $OUT_DIR) { Remove-Item $f.FullName -Force }
             }
-            Write-Log "OK: Sent $($files.Count) files to clipboard! ($totalSizeMB MB)" "Green"
+            Write-Log "OK: Sent $($packed.Count) of $($files.Count) files to clipboard! ($totalSizeMB MB)" "Green"
             [System.Media.SystemSounds]::Asterisk.Play()
 
             # Ожидание для режима PackAuto (SEND FILE auto)
@@ -961,18 +965,37 @@ function Initialize-ChangeLog {
     if (Test-Path -LiteralPath $script:ChangeLogPath) {
         foreach ($line in @(Get-Content -LiteralPath $script:ChangeLogPath -Encoding UTF8)) {
             if ($line -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\|(SENT|RECEIVED|SNAPSHOT|LOCKED)\|(.+)\|(\d+)\|(\d+)$') {
-                $script:ChangeLog["$($matches[2])|$($matches[3])|$($matches[4])"] = $matches[1]
+                # Ключ в памяти (Get-SyncKey) — в нижнем регистре, а строка журнала хранит
+                # путь как есть: без приведения файлы с заглавными буквами после
+                # перезапуска слушателя считались новыми и отправлялись повторно.
+                $script:ChangeLog["$($matches[2].ToLowerInvariant())|$($matches[3])|$($matches[4])"] = $matches[1]
                 $loaded++
             }
         }
     }
 
-    # Первый запуск (журнала нет) или журнал разросся: пересоздаём из актуальных файлов папки —
-    # всё, что лежит на диске, помечается SNAPSHOT (считается синхронизированным).
+    # Первый запуск (журнала нет): всё, что лежит на диске, помечается SNAPSHOT.
     $rebuild = -not (Test-Path -LiteralPath $script:ChangeLogPath)
-    if (-not $rebuild) {
-        $lineCount = @(Get-Content -LiteralPath $script:ChangeLogPath -Encoding UTF8).Count
-        if ($lineCount -gt 2000) { $rebuild = $true }
+
+    # Журнал разросся: сжимаем его (одна строка на ключ, только существующие объекты).
+    # Раньше здесь делался SNAPSHOT всей папки — и файлы, ещё не отправленные
+    # к моменту перезапуска, молча считались синхронизированными и не уходили.
+    if (-not $rebuild -and $loaded -gt 2000) {
+        $now  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $kept = New-Object System.Collections.Generic.List[string]
+        $live = @{}
+        foreach ($k in $script:ChangeLog.Keys) {
+            $rel = ($k -split '\|')[0]
+            $obj = if ($rel.StartsWith('dir/')) { $rel.Substring(4) } else { $rel }
+            if (Test-Path -LiteralPath (Join-Path $script:SyncDir $obj)) {
+                $kept.Add("$now|$($script:ChangeLog[$k])|$k")
+                $live[$k] = $script:ChangeLog[$k]
+            }
+        }
+        Set-Content -LiteralPath $script:ChangeLogPath -Value $kept -Encoding UTF8
+        $script:ChangeLog = $live
+        Write-Log "SYNC: change.log compacted: $loaded -> $($kept.Count) record(s)." "DarkGray"
+        $loaded = $kept.Count
     }
 
     if ($rebuild) {
@@ -1274,12 +1297,27 @@ function Expand-SyncBatch {
     param([string]$ZipPath)
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
+    # Защита от zip-slip: из пути выкидываются '', '.', '..' и сегменты с ':',
+    # итоговый путь обязан лежать внутри SyncDir
+    $root = [System.IO.Path]::GetFullPath($script:SyncDir).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    $safeRel = {
+        param([string]$p)
+        $r = (($p -replace '\\', '/') -split '/' | Where-Object { $_ -notin @('', '.', '..') -and $_ -notmatch ':' }) -join '/'
+        if (-not $r) { return $null }
+        $full = [System.IO.Path]::GetFullPath((Join-Path $script:SyncDir $r))
+        if (-not $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+        return $r
+    }
     try {
         $zip = [System.IO.Compression.ZipFile]::Open($ZipPath, 'Read', [System.Text.Encoding]::UTF8)
         try {
             foreach ($entry in $zip.Entries) {
-                $rel = ($entry.FullName -replace '\\', '/').TrimEnd('/')
-                if (-not $rel -or $rel -eq '_syncdirs.txt') { continue }
+                if ($entry.FullName -eq '_syncdirs.txt') { continue }
+                $rel = & $safeRel $entry.FullName
+                if (-not $rel) {
+                    Write-Log "SYNC: batch entry '$($entry.FullName)' rejected (unsafe path)" "Yellow"
+                    continue
+                }
                 $target = Join-Path $script:SyncDir ($rel -replace '/', '\')
                 if ($entry.FullName.EndsWith('/')) {
                     if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
@@ -1299,7 +1337,7 @@ function Expand-SyncBatch {
                 $content = $sr.ReadToEnd()
                 $sr.Close()
                 foreach ($line in ($content -split "`r?`n")) {
-                    $d = $line.Trim()
+                    $d = & $safeRel $line.Trim()
                     if (-not $d) { continue }
                     $target = Join-Path $script:SyncDir ($d -replace '/', '\')
                     if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
@@ -1433,7 +1471,12 @@ function Scan-SyncDir {
         if (-not (Test-FileFree -Path $file.FullName)) { continue }   # занятые — в следующий скан
         $pendingFiles += [pscustomobject]@{ File = $file; Rel = $rel; Key = $key }
     }
-    if (($pendingDirs.Count + $pendingFiles.Count) -ge $script:SyncBatchFiles) {
+    # SyncBatchFiles=0 — пакетный режим выключен (раньше 0 >= 0 включал его всегда
+    # и каждое сканирование слало пустой архив)
+    if ($script:SyncBatchFiles -gt 0 -and ($pendingDirs.Count + $pendingFiles.Count) -ge $script:SyncBatchFiles) {
+        # Backoff пакета: после неудачи повтор не раньше окна (раньше проверки не было,
+        # и архив пересобирался и слался каждым сканом)
+        if (-not (Test-SyncRetryReady -RelPath ".syncbatch" -SyncKey "batch")) { return }
         Write-Log "SYNC: batch mode: $($pendingFiles.Count) file(s) + $($pendingDirs.Count) folder(s) -> single zip" "Cyan"
         $zipPath = New-SyncBatchZip -Files $pendingFiles -DirRelPaths $pendingDirs
         if ($zipPath) {
@@ -3082,8 +3125,8 @@ elseif ($Action -eq "UnpackTo") {
         }
         [void](Invoke-ManualReceive -TargetDir $destination -NoRoutes:(-not $script:RoutesOverrideUnpackTo))
     } else {
-        Write-Log "ERROR: No target path given for UnpackTo!" "Red"
-        $script:HasError = $true
+        # Без пути (хоткей Ctrl+Alt+V запускает ярлык без аргументов) — приём в InDir
+        [void](Invoke-ManualReceive -TargetDir $IN_DIR -NoRoutes:(-not $script:RoutesOverrideUnpackTo))
     }
 }
 elseif ($Action -eq "LocalShow") {
