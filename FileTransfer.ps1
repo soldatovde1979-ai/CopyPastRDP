@@ -444,7 +444,11 @@ function Send-FileInChunks {
                     Start-Sleep -Milliseconds $script:PollIntervalMs
                     try {
                         if (-not [System.Windows.Forms.Clipboard]::ContainsText()) { $acked = $true; break }
-                    } catch { $acked = $true; break }
+                    } catch {
+                        # Исключение буфера ≠ подтверждение приёма: чанк мог
+                        # не дойти, считаем неудачей (как при таймауте).
+                        $acked = $false; break
+                    }
                 }
                 if (-not $acked) {
                     Write-Log "FATAL: receiver did not pick up chunk $chunkIndex/$totalChunks within $script:SyncAckTimeoutSec sec - transfer aborted, file kept. Is the listener running on the other side?" "Red"
@@ -2061,9 +2065,9 @@ function Invoke-SendNow {
     Remove-Item -LiteralPath $ListFile -Force -ErrorAction SilentlyContinue
     if ($paths.Count -eq 0) { Write-Log "SENDNOW: пустой список" "Yellow"; return }
 
-    # Быстрый ACK (как у фоновой синхронизации): живой приёмник забирает чанк
-    # за 1-3 сек; приёмник недоступен — не ждём 60 сек
-    $script:SyncAckTimeoutSec = $script:SyncAckFastSec
+    # Ручная отправка ждёт ACK штатным SyncAckTimeoutSec (60 сек): чанк 5 МБ
+    # переносится по RDP дольше 3 сек, быстрый таймаут давал ложные
+    # «НЕ ПЕРЕДАНО» при живом приёмнике (пакет отзывался посреди переноса).
 
     $ok = 0; $fail = 0
     foreach ($line in $paths) {
@@ -2445,9 +2449,12 @@ function Get-WebStateHtml {
         "<button class='btn tool warn' onclick=`"post('/syncpause');`">Пауза синхр.</button>"
     }
     $listen = if ($running) {
-        "<span class='st on'>&#9679;</span> <b>Слушатель</b> <form method='post' action='/stop' style='display:inline' onsubmit=`"return confirm('Остановить слушателя?')`"><button class='btn stop sm'>Стоп</button></form> $pauseBtn"
+        # Нативные <form> не несут заголовок X-CP-Token и получают 403 после
+        # введения анти-CSRF проверки — кнопки шлют POST через post() из
+        # dashboard.html (fetch-обёртка добавляет токен).
+        "<span class='st on'>&#9679;</span> <b>Слушатель</b> <button class='btn stop sm' onclick=`"if(confirm('Остановить слушателя?')) post('/stop');`">Стоп</button> $pauseBtn"
     } else {
-        "<span class='st off'>&#9679;</span> <b>Слушатель</b> <form method='post' action='/start' style='display:inline'><button class='btn start sm'>Пуск</button></form> $pauseBtn"
+        "<span class='st off'>&#9679;</span> <b>Слушатель</b> <button class='btn start sm' onclick=`"post('/start');`">Пуск</button> $pauseBtn"
     }
     $queueHtml = "$queueTxt$(if ($paused) { ' · <b style=''color:#e8c268''>на паузе</b>' })"
     # Очередь в виде списка файлов (для панели под логом)
@@ -2901,7 +2908,7 @@ function Invoke-WebStatus {
                             $staged = @(); $hints = @(); $inside = @()
                             foreach ($rel in $paths) {
                                 $isAbs = $rel -match '^[A-Za-z]:'
-                                $src = if ($isAbs) { $rel -replace '/', '\' } else { Resolve-SyncPath -Rel $_ }
+                                $src = if ($isAbs) { $rel -replace '/', '\' } else { Resolve-SyncPath -Rel $rel }
                                 if (-not $src -or -not (Test-Path -LiteralPath $src)) { continue }
                                 if (Test-Path -LiteralPath $src -PathType Container) { Write-Log "CMD: '$rel' — папка; перемещение папок не поддерживается, используйте копирование" "Yellow"; continue }
                                 $stagedPath = Join-Path $stage (Split-Path -Leaf $src)
