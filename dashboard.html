@@ -119,7 +119,7 @@ function sendAll(){
     .then(function(){ location.reload(); });
 }
 function clearQueue(){
-  if (!confirm('Очистить очередь (локальный disk)? Содержимое уедет в бэкап.')) return;
+  if (!confirm('Очистить очередь? Файлы останутся на disk, но будут помечены как отправленные - синхронизация их больше не отправит.')) return;
   fetch('/clearqueue', {method:'POST'}).then(function(){ location.reload(); });
 }
 function post(p){ fetch(p,{method:'POST'}).then(function(){ location.reload(); }); }

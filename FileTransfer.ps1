@@ -2774,9 +2774,28 @@ function Invoke-WebStatus {
                 } elseif ($path -eq "/opensync") {
                     Start-Process -FilePath "explorer.exe" -ArgumentList "`"$script:SyncDir`""
                 } elseif ($path -eq "/clearqueue") {
-                    # Очистить очередь: содержимое локального SyncDir (с бэкапом в TEMP).
-                    # Другой контур не затрагивается — в отличие от ClearDisk.
-                    [void](Clear-SyncDirLocal)
+                    # Очистить очередь: все неотправленные файлы disk помечаются SENT.
+                    # Файлы остаются на месте, автосинхронизация их больше не отправляет
+                    # (при изменении файла метка снимется и он уедет как новый).
+                    # ChangeLogPath инициализируется только в Watch - здесь задаём сами.
+                    $script:ChangeLogPath = Join-Path $script:SyncDir "change.log"
+                    $markedQ = @{}
+                    Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+                        $pq = $_ -split '\|', 3
+                        if ($pq.Count -ge 3 -and $pq[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) {
+                            $markedQ[$pq[2].ToLowerInvariant()] = $true
+                            $markedQ[(($pq[2] -split '\|')[0]).ToLowerInvariant()] = $true
+                        }
+                    }
+                    $cntQ = 0
+                    foreach ($fq in @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -notin @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
+                        $relQ = Get-RelPath -FullName $fq.FullName
+                        if ($markedQ[$relQ.ToLowerInvariant()]) { continue }
+                        Add-ChangeEntry -Type "SENT" -RelPath $relQ -Item $fq
+                        $cntQ++
+                    }
+                    Write-Log "Web: очередь disk очищена - $cntQ файл(ов) помечено SENT, файлы остались на disk" "White"
                 } elseif ($path -eq "/openlog") {
                     # Просмотр журнала: LogTracker.ps1, если рядом, иначе блокнот
                     $ltPath = Join-Path (Split-Path -Parent $PSCommandPath) "LogTracker.ps1"
@@ -2947,7 +2966,7 @@ function Invoke-WebStatus {
                 "<button class='btn stop' onclick=`"if(confirm('Остановить ВСЕ задания: слушатель, отправки, gw-proxy, хоткеи?')) post('/stopall');`">Стоп все</button>" +
                 $zooBtn +
                 "<button class='btn tool' onclick=`"post('/opensync');`">SyncDir</button>" +
-                "<button class='btn stop' onclick=`"if(confirm('Очистить очередь (локальный SyncDir)? Содержимое уедет в бэкап.')) post('/clearqueue');`">Очистить</button>" +
+                "<button class='btn stop' onclick=`"if(confirm('Очистить очередь? Файлы останутся на disk, но будут помечены как отправленные - синхронизация их больше не отправит.')) post('/clearqueue');`">Очистить</button>" +
                 "<button class='btn tool' onclick=`"post('/openlog');`">Журнал</button>" +
                 "<button class='btn tool' onclick=`"if(confirm('Очистить журнал событий?')) post('/clearlog');`">Очистить лог</button>" +
                 "<span id='note' class='sub'></span>"
