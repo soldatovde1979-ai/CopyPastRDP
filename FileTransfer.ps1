@@ -239,8 +239,13 @@ $script:SendFailures = @{}
 # Блок фоновых отправок служебных карточек (status-*/progress-*): после первой
 # же неудачи карточки не ретраятся вовсе. Разблокировка — при успешной реальной
 # передаче (канал жив). Иначе карточка, переписываемая heartbeat'ом каждые 30 сек
-# (новый sync-ключ), ретраится вечно и занимает буфер JSON-пакетом каждую минуту.
 $script:ServiceSendBlocked = $false
+
+# Кэш панели «Другой ПК» командера: наполняется из status-*.json и живёт до
+# нажатия «Обновить» (/refresh-remote) — панель не дёргается при каждом рендере.
+$script:RemoteFilesCache = $null
+$script:RemoteFilesMachine = ""
+$script:RemoteFilesTime = ""
 
 # Разговоживание строк «НЕ ПЕРЕДАНО»: один и тот же путь логируется не чаще
 # раза в FailLogIntervalSec — иначе лежащая удалёнка заливает журнал каждый backoff.
@@ -252,7 +257,7 @@ $script:ReceiveStarts = @{}
 
 # Единый фильтр «значимых» событий: и в status-файл, и в историю дашборда.
 # Один источник — фильтры не разъезжаются (правка в одном месте).
-$script:DashboardEventPattern = 'ОТПРАВКА|ОТПРАВЛЕНО|ПРИЁМ|ПРИНЯТО|НЕ ПЕРЕДАНО|FAIL|FATAL|ERROR|WARNING|CLEAR-DISK|DEL-MARKER|AUTOUPDATE|DROP'
+$script:DashboardEventPattern = 'ОТПРАВКА|ОТПРАВЛЕНО|ПРИЁМ|ПРИНЯТО|НЕ ПЕРЕДАНО|FAIL|FATAL|ERROR|WARNING|CLEAR-DISK|DEL-MARKER|AUTOUPDATE|DROP|CMD:'
 
 # Персистентный журнал диска change.log (внутри SyncDir): ключ "relpath|длина|LastWriteTimeUtc"
 # -> тип записи (SNAPSHOT/SENT/RECEIVED/LOCKED). Заменяет in-memory-память: что отправлено
@@ -991,6 +996,25 @@ function Initialize-ChangeLog {
     }
     # Файлы, которых нет в журнале, считаются новыми и будут отправлены
     # при первом же сканировании (даже если слушатель был выключен).
+    $script:ChangeLogMtime = (Get-Item -LiteralPath $script:ChangeLogPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
+}
+
+function Test-ChangeLogExternal {
+    # True, если change.log переписан извне (командер через Web-процесс):
+    # слушатель перечитывает журнал сам, без перезапуска — никакие окна не мелькают.
+    if (-not $script:ChangeLogPath) { return }
+    $mt = (Get-Item -LiteralPath $script:ChangeLogPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
+    if ($mt -and $script:ChangeLogMtime -and $mt -ne $script:ChangeLogMtime) {
+        $script:ChangeLog = @{}
+        foreach ($line in @(Get-Content -LiteralPath $script:ChangeLogPath -Encoding UTF8)) {
+            if ($line -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\|(SENT|RECEIVED|SNAPSHOT|LOCKED)\|(.+)\|(\d+)\|(\d+)$') {
+                $script:ChangeLog["$($matches[2])|$($matches[3])|$($matches[4])"] = $matches[1]
+            }
+        }
+        $script:ChangeLogMtime = $mt
+        Write-Log "SYNC: change.log перечитан (внешнее изменение из командера)" "DarkGray"
+    }
+    if (-not $script:ChangeLogMtime -or $script:ChangeLogMtime -ne $mt) { $script:ChangeLogMtime = $mt }
 }
 
 function Wait-SyncAck {
@@ -1302,6 +1326,9 @@ function Scan-SyncDir {
     # (Pack/PackAuto — SyncMode выключен) не затрагиваются.
     if ($script:SyncIdleGuardSec -gt 0 -and (Get-UserIdleSeconds) -lt $script:SyncIdleGuardSec) { return }
 
+    # change.log переписан командером (Web-процесс)? Перечитываем без рестарта
+    Test-ChangeLogExternal
+
     # Маркер удаления: файл .del в КОРНЕ SyncDir -> очистка ВСЕЙ папки на обоих контурах.
     # Маркер синхронизируется как обычный файл: сначала он отправляется на другой
     # контур (существующим чанковым механизмом), и только после подтверждения
@@ -1340,6 +1367,24 @@ function Scan-SyncDir {
             }
             # Маркер ещё не отправлен: продолжаем обычный скан (маркер из
             # перечисления исключён) - попытка повторится при следующем скане.
+        }
+    }
+
+    # Маркеры командера: .rm (удалить перечисленное на приёмнике) и .get
+    # (запросить перечисленное у приёмника). Создаются дашбордом, уезжают
+    # обычным порядком (стандартная отправка, пометка SENT); применяются
+    # только на ПРИЁМЕ (RECEIVED) - свой маркер контур не исполняет.
+    foreach ($mk in @('.rm', '.get')) {
+        $mkPath = Join-Path $script:SyncDir $mk
+        if (-not (Test-Path -LiteralPath $mkPath -PathType Leaf)) { continue }
+        $mkItem = Get-Item -LiteralPath $mkPath -Force -ErrorAction SilentlyContinue
+        if (-not $mkItem) { continue }
+        $mkKey = Get-SyncKey -Item $mkItem -RelPath $mk
+        $mkStatus = if ($script:ChangeLog.ContainsKey($mkKey)) { $script:ChangeLog[$mkKey] } else { "" }
+        if ($mkStatus -eq 'RECEIVED') {
+            Apply-SyncMarker -Path $mkPath -Mode $mk.TrimStart('.')
+            Remove-Item -LiteralPath $mkPath -Force -ErrorAction SilentlyContinue
+            [void](Remove-ChangeEntries -RelPaths @($mk))
         }
     }
 
@@ -1649,7 +1694,19 @@ function Watch-Clipboard {
                             @{ T = $matches[1]; M = $m1 }
                         }
                     })
-                $st = @{ Machine = $env:COMPUTERNAME; Time = (Get-Date -Format "yyyy-MM-dd HH:mm:ss"); Events = $ev }
+                # Манифест содержимого disk для панели «Другой ПК» в командере:
+                # строки "rel|размер|f|d" (файл/папка). Лимит 2000 - защита от
+                # раздувания status-файла.
+                $manifest = @(Get-ChildItem -Path $script:SyncDir -Recurse -Force -ErrorAction SilentlyContinue |
+                    Select-Object -First 2000 | ForEach-Object {
+                        $mRel = Get-RelPath -FullName $_.FullName
+                        if (-not $mRel) { return }
+                        if ($_.PSIsContainer) { "$mRel|0|d" }
+                        elseif ($_.Name -in @('change.log', '.del', '.rm', '.get', '.syncpause') -or $_.Extension -in @('.part', '.synczip')) { return }
+                        elseif ($_.Name -match '^(status|progress)-') { return }
+                        else { "$mRel|$($_.Length)|f" }
+                    })
+                $st = @{ Machine = $env:COMPUTERNAME; Time = (Get-Date -Format "yyyy-MM-dd HH:mm:ss"); Events = $ev; Files = $manifest }
                 $stPath = Join-Path $script:SyncDir ("status-{0}.json" -f $env:COMPUTERNAME)
                 $st | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $stPath -Encoding UTF8
             } catch {}
@@ -1829,6 +1886,98 @@ function Invoke-DelLocal {
     $what = if ($Key) { "[$Section] $Key" } else { "section [$Section]" }
     Write-Log "LOCAL: removed $what ($removed key(s))" "Green"
     Restart-WatchIfRunning
+}
+
+function Resolve-SyncPath {
+    # Безопасное разрешение относительного пути внутри SyncDir: '..' и выход
+    # за корень запрещены. Возвращает $null для подозрительных путей.
+    param([string]$Rel)
+    $norm = ($Rel -replace '\\', '/').Trim('/')
+    if (-not $norm -or $norm -match '\.\.' -or $norm -match '^[A-Za-z]:') { return $null }
+    $full = [System.IO.Path]::GetFullPath((Join-Path $script:SyncDir $norm))
+    $root = [System.IO.Path]::GetFullPath($script:SyncDir)
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    return $full
+}
+
+function Remove-ChangeEntries {
+    # Удалить записи change.log для перечисленных путей (файл, папка и всё
+    # их содержимое). Записи пропадут - объекты считаются новыми и уедут при
+    # следующем скане. Вызывается из Web-процесса: после правки change.log
+    # слушателя нужно перезапустить (он держит журнал в памяти).
+    param([string[]]$RelPaths)
+    $logPath = Join-Path $script:SyncDir "change.log"
+    if (-not (Test-Path -LiteralPath $logPath)) { return }
+    $norm = @($RelPaths | ForEach-Object { ($_ -replace '\\', '/').Trim('/').ToLowerInvariant() } | Where-Object { $_ })
+    if ($norm.Count -eq 0) { return }
+    $kept = New-Object System.Collections.Generic.List[string]
+    $removed = 0
+    foreach ($line in @(Get-Content -LiteralPath $logPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        $m = [regex]::Match($line, '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\|(SENT|RECEIVED|SNAPSHOT|LOCKED)\|(.+)\|\d+\|\d+$')
+        if (-not $m.Success) { continue }
+        $key = $m.Groups[2].Value.ToLowerInvariant()
+        $hit = $false
+        foreach ($p in $norm) {
+            if ($key -eq $p -or $key -eq "dir/$p" -or $key -like "$p/*" -or $key -like "dir/$p/*") { $hit = $true; break }
+        }
+        if ($hit) { $removed++ } else { [void]$kept.Add($line) }
+    }
+    Set-Content -LiteralPath $logPath -Value $kept -Encoding UTF8
+    return $removed
+}
+
+function Backup-SyncItem {
+    # Перенос элемента SyncDir в бэкап TEMP с сохранением относительного пути
+    param([string]$Rel)
+    $full = Resolve-SyncPath -Rel $Rel
+    if (-not $full -or -not (Test-Path -LiteralPath $full)) { return }
+    try {
+        $bk = Join-Path (Join-Path $env:TEMP "CHANGE-backup") ("cmd-" + (Get-Date -Format "yyyyMMdd"))
+        $dest = Join-Path $bk $Rel
+        $destDir = Split-Path -Parent $dest
+        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+        Move-Item -LiteralPath $full -Destination $dest -Force
+    } catch {
+        Write-Log "CMD: backup failed for '$Rel' - $($_.Exception.Message)" "Yellow"
+    }
+}
+
+function Apply-SyncMarker {
+    # Применение полученного маркера .rm (удалить перечисленное локально) или
+    # .get (перечисленное отправить заново - снимаются отметки change.log).
+    # Применяется только на ПРИЁМЕ: свой маркер контур не исполняет.
+    param([string]$Path, [string]$Mode)
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($l in @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        $rel = ($l.Trim() -replace '\\', '/').Trim('/')
+        if (-not $rel -or $rel -match '\.\.' -or $rel -in @('change.log', '.del', '.rm', '.get', '.syncpause')) { continue }
+        if (Resolve-SyncPath -Rel $rel) { $paths.Add($rel) }
+    }
+    if ($paths.Count -eq 0) { return }
+    if ($Mode -eq 'rm') {
+        foreach ($rel in $paths) { Backup-SyncItem -Rel $rel }
+        [void](Remove-ChangeEntries -RelPaths $paths.ToArray())
+        Write-Log "CMD: .rm применён - удалено $($paths.Count) эл. (бэкап в TEMP)" "White"
+    } else {
+        [void](Remove-ChangeEntries -RelPaths $paths.ToArray())
+        Write-Log "CMD: .get применён - помечено к отправке $($paths.Count) эл." "White"
+    }
+}
+
+function Get-SyncFileList {
+    # Плоский список содержимого SyncDir для командера: "rel|размер|f|d",
+    # служебные файлы исключены. Лимит 3000 записей (защита от гигантских JSON).
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(Get-ChildItem -Path $script:SyncDir -Recurse -Force -ErrorAction SilentlyContinue)) {
+        if ($list.Count -ge 3000) { break }
+        $rel = Get-RelPath -FullName $item.FullName
+        if (-not $rel) { continue }
+        if ($item.PSIsContainer) { $list.Add("$rel|0|d"); continue }
+        if ($item.Name -in @('change.log', '.del', '.rm', '.get', '.syncpause') -or $item.Extension -in @('.part', '.synczip')) { continue }
+        if ($item.Name -match '^(status|progress)-') { continue }
+        $list.Add("$rel|$($item.Length)|f")
+    }
+    return $list
 }
 
 function Invoke-Resend {
@@ -2124,6 +2273,89 @@ function Update-IniSettings {
     Set-Content -LiteralPath $Path -Value $lines -Encoding UTF8
 }
 
+function Get-WebStateHtml {
+    # Динамические фрагменты дашборда (статусы, очередь, лог, прогресс):
+    # общий источник для первого рендера страницы и для /state (живое
+    # обновление лога/статусов без перезагрузки страницы).
+    $dash = Get-DashboardState
+    $rows = New-Object System.Text.StringBuilder
+    foreach ($ev in $dash.Events) {
+        $cls = "svc"
+        if ($ev.M -match 'FAIL|FATAL|ERROR|НЕ ПЕРЕДАНО') { $cls = "bad" }
+        elseif ($ev.M -match 'WARNING') { $cls = "warn" }
+        [void]$rows.AppendLine("<tr class='$cls'><td>$($ev.T)</td><td>$([System.Net.WebUtility]::HtmlEncode($ev.M))</td></tr>")
+    }
+
+    # Прогресс передач: progress-*.json из SyncDir (свой + чужой)
+    $progRows = New-Object System.Text.StringBuilder
+    foreach ($pf in @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "progress-*.json" -ErrorAction SilentlyContinue)) {
+        try {
+            $j = $pf | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
+            $pct = if ($j.Total -gt 0) { [math]::Min(100, [int](100 * $j.Chunk / $j.Total)) } else { 0 }
+            $dirTxt = if ($j.Dir -eq "send") { "&rarr; на другой ПК" } else { "&larr; с другого ПК" }
+            $age = [int]((Get-Date) - [datetime]::ParseExact([string]$j.Started, "yyyy-MM-dd HH:mm:ss", $null)).TotalSeconds
+            $stale = if ($age -gt 120) { " <span class='sub'>&middot; нет обновлений $age сек</span>" } else { "" }
+            [void]$progRows.AppendLine("<div class='prow'><div class='ptitle'>${dirTxt}: $([System.Net.WebUtility]::HtmlEncode([string]$j.File)) <span class='sub'>чанк $($j.Chunk)/$($j.Total)$stale</span></div><div class='pbar'><div class='pfill' style='width:$pct%'></div></div></div>")
+        } catch {}
+    }
+    $progressHtml = if ($progRows.Length -gt 0) { $progRows.ToString() } else { "" }
+
+    $running = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*-File*FileTransfer.ps1*Watch*" }).Count -gt 0
+    # Очередь disk: файлы без отметки SENT/RECEIVED/SNAPSHOT в change.log
+    $queueCount = 0
+    $queueMB = 0.0
+    try {
+        $marked = @{}
+        Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = $_ -split '\|', 3
+            if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked[$p[2].ToLowerInvariant()] = $true }
+        }
+        foreach ($f in @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
+            $rel = (Get-RelPath -FullName $f.FullName).ToLowerInvariant()
+            if (-not $marked[$rel]) { $queueCount++; $queueMB += $f.Length / 1MB }
+        }
+    } catch {}
+    $queueTxt = if ($queueCount -gt 0) { "очередь: <b>$queueCount</b> файл(ов), $([math]::Round($queueMB, 1)) МБ" } else { "очередь пуста" }
+    $paused = Test-Path (Join-Path $script:SyncDir ".syncpause")
+    $pauseBtn = if ($paused) {
+        "<button class='btn tool' onclick=`"post('/syncpause');`">Возобновить синхр.</button>"
+    } else {
+        "<button class='btn tool warn' onclick=`"post('/syncpause');`">Пауза синхр.</button>"
+    }
+    $listen = if ($running) {
+        "<span class='st on'>&#9679;</span> <b>Слушатель</b> <form method='post' action='/stop' style='display:inline' onsubmit=`"return confirm('Остановить слушателя?')`"><button class='btn stop sm'>Стоп</button></form> $pauseBtn"
+    } else {
+        "<span class='st off'>&#9679;</span> <b>Слушатель</b> <form method='post' action='/start' style='display:inline'><button class='btn start sm'>Пуск</button></form> $pauseBtn"
+    }
+    $queueHtml = "$queueTxt$(if ($paused) { ' · <b style=''color:#e8c268''>на паузе</b>' })"
+    # Очередь в виде списка файлов (для панели под логом)
+    $qf = New-Object System.Text.StringBuilder
+    try {
+        $marked2 = @{}
+        Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = $_ -split '\|', 3
+            if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked2[$p[2].ToLowerInvariant()] = $true }
+        }
+        $shown = 0
+        foreach ($f in @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
+            $rel = (Get-RelPath -FullName $f.FullName).ToLowerInvariant()
+            if ($marked2[$rel]) { continue }
+            $shown++
+            if ($shown -le 200) { [void]$qf.AppendLine("<div class='row file'><span class='ic'>&#128196;</span><span class='nm' title='$([System.Net.WebUtility]::HtmlEncode($rel))'>$([System.Net.WebUtility]::HtmlEncode($rel))</span><span class='sz'>$([math]::Round($f.Length / 1KB, 1)) КБ</span></div>") }
+        }
+        if ($shown -gt 200) { [void]$qf.AppendLine("<div class='sub' style='padding:2px 6px'>... всего $shown</div>") }
+    } catch {}
+    if ($shown -eq 0) { [void]$qf.AppendLine("<div class='sub' style='padding:2px 6px'>пуста</div>") }
+    $remoteHtml = if ($dash.RemoteName) {
+        if ($dash.RemoteAge -lt 120) { "Другой ПК: <b>$($dash.RemoteName) <span class='on'>&#9679;</span> $($dash.RemoteAge) сек</b>" }
+        else { "Другой ПК: <b>$($dash.RemoteName) <span class='off'>&#9679;</span> молчит $([int]($dash.RemoteAge/60)) мин</b>" }
+    } else { "Другой ПК: <b>нет данных</b>" }
+    return @{ Listen = $listen; Queue = $queueHtml; QueueFiles = $qf.ToString(); Remote = $remoteHtml; Rows = $rows.ToString(); Progress = $progressHtml; Running = $running }
+}
+
 function Get-NumField {
     # Поле формы параметров: текущее значение ключа из setcp.ini + подпись
     param([string]$Key, [string]$Label, [string]$Hint, [string]$Def)
@@ -2195,6 +2427,82 @@ function Invoke-WebStatus {
                 $resp.ContentType = "text/plain; charset=utf-8"
                 $resp.ContentLength64 = $textBytes.Length
                 $resp.OutputStream.Write($textBytes, 0, $textBytes.Length)
+                $resp.OutputStream.Close()
+                continue
+            }
+            if ($path -eq "/files") {
+                # Список файлов для панелей командера: panel=local (SyncDir) или
+                # panel=remote (манифест из status-*.json, кэш до /refresh-remote)
+                $panel = [string]$ctx.Request.QueryString["panel"]
+                $resp.ContentType = "application/json; charset=utf-8"
+                if ($panel -eq "local") {
+                    $j = @{ ok = $true; files = @(Get-SyncFileList); root = $script:SyncDir }
+                } else {
+                    if (-not $script:RemoteFilesCache) {
+                        try {
+                            $rf = @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "status-*.json" -ErrorAction SilentlyContinue |
+                                Where-Object { $_.Name -ine "status-$env:COMPUTERNAME.json" } | Select-Object -First 1)
+                            if ($rf) {
+                                $j0 = $rf[0] | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
+                                $script:RemoteFilesCache = @($j.Files)
+                                $script:RemoteFilesMachine = [string]$j.Machine
+                                $script:RemoteFilesTime = [string]$j.Time
+                            }
+                        } catch {}
+                    }
+                    $j = @{ ok = $true; files = $script:RemoteFilesCache; machine = $script:RemoteFilesMachine; time = $script:RemoteFilesTime }
+                }
+                $json = $j | ConvertTo-Json -Compress -Depth 3
+                $b = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $resp.ContentLength64 = $b.Length
+                $resp.OutputStream.Write($b, 0, $b.Length)
+                $resp.OutputStream.Close()
+                continue
+            }
+            if ($path -eq "/state") {
+                # Динамика для живого обновления: статусы, очередь, лог, прогресс.
+                # Страница НЕ перезагружается — только эти фрагменты подменяются.
+                $ws = Get-WebStateHtml
+                $j = @{ listen = $ws.Listen; remote = $ws.Remote; rows = $ws.Rows; progress = $ws.Progress; queuefiles = $ws.QueueFiles }
+                $js = $j | ConvertTo-Json -Compress
+                $b = [System.Text.Encoding]::UTF8.GetBytes($js)
+                $resp.ContentType = "application/json; charset=utf-8"
+                $resp.ContentLength64 = $b.Length
+                $resp.OutputStream.Write($b, 0, $b.Length)
+                $resp.OutputStream.Close()
+                continue
+            }
+            if ($path -eq "/clearlog") {
+                # Очистить журнал разработчика/передач (файл обнуляется)
+                try {
+                    Set-Content -LiteralPath $LOG_FILE -Value "" -Encoding UTF8
+                    Write-Log "Журнал очищен из дашборда" "White"
+                } catch {}
+                $resp.StatusCode = 302
+                $resp.Headers["Location"] = "/"
+                $resp.OutputStream.Close()
+                continue
+            }
+            if ($path -eq "/refresh-remote") {
+                # Сброс кэша панели «Другой ПК» — список обновится при следующей загрузке
+                $script:RemoteFilesCache = $null
+                $resp.StatusCode = 302
+                $resp.Headers["Location"] = "/"
+                $resp.OutputStream.Close()
+                continue
+            }
+            if ($path -eq "/open") {
+                # Открыть файл/папку из SyncDir по щелчку в командере (только внутри SyncDir)
+                $rel = [string]$ctx.Request.QueryString["rel"]
+                $full = Resolve-SyncPath -Rel $rel
+                if ($full -and (Test-Path -LiteralPath $full)) {
+                    if (Test-Path -LiteralPath $full -PathType Container) {
+                        Start-Process -FilePath "explorer.exe" -ArgumentList "`"$full`""
+                    } else {
+                        Start-Process -FilePath "explorer.exe" -ArgumentList "/select,`"$full`""
+                    }
+                }
+                $resp.StatusCode = 204
                 $resp.OutputStream.Close()
                 continue
             }
@@ -2305,6 +2613,39 @@ function Invoke-WebStatus {
                     } else {
                         Start-Process -FilePath "notepad.exe" -ArgumentList "`"$LOG_FILE`""
                     }
+                } elseif ($path -eq "/cmd") {
+                    # Команды командера: panel=loc|rem, op=copy|del, paths=строки
+                    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [System.Text.Encoding]::UTF8)
+                    $body = $reader.ReadToEnd(); $reader.Close()
+                    $kv = @{}
+                    foreach ($pair in ($body -split '&')) {
+                        $p = $pair -split '=', 2
+                        if ($p.Count -eq 2) { $kv[[System.Net.WebUtility]::UrlDecode($p[0])] = [System.Net.WebUtility]::UrlDecode($p[1]) }
+                    }
+                    $panel = [string]$kv['panel']; $op = [string]$kv['op']
+                    $paths = @($kv['paths'] -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
+                        ForEach-Object { ($_ -replace '\\', '/').Trim('/') } | Where-Object { $_ -and $_ -notmatch '\.\.' })
+                    $paths = @($paths | Select-Object -Unique)
+                    if ($paths.Count -gt 0 -and $panel -in @('loc', 'rem') -and $op -in @('copy', 'del')) {
+                        if ($panel -eq 'loc' -and $op -eq 'copy') {
+                            # Локально: снять отметки change.log - уедет при следующем окне простоя.
+                            # Слушатель сам перечитает change.log по mtime - без перезапуска.
+                            $rm = Remove-ChangeEntries -RelPaths $paths
+                            Write-Log "CMD: к отправке помечено $($paths.Count) эл. (записей снято: $rm)" "White"
+                        } elseif ($panel -eq 'loc' -and $op -eq 'del') {
+                            foreach ($rel in $paths) { Backup-SyncItem -Rel $rel }
+                            [void](Remove-ChangeEntries -RelPaths $paths)
+                            Write-Log "CMD: удалено локально $($paths.Count) эл. (бэкап в TEMP)" "White"
+                        } elseif ($panel -eq 'rem' -and $op -eq 'copy') {
+                            # Запросить файлы у другого ПК: маркер .get уедет синхронизацией,
+                            # приёмник снимет у себя отметки и отправит перечисленное
+                            Set-Content -LiteralPath (Join-Path $script:SyncDir ".get") -Value ($paths -join "`r`n") -Encoding UTF8
+                            Write-Log "CMD: запрошено у другого ПК $($paths.Count) эл. (маркер .get)" "White"
+                        } elseif ($panel -eq 'rem' -and $op -eq 'del') {
+                            Set-Content -LiteralPath (Join-Path $script:SyncDir ".rm") -Value ($paths -join "`r`n") -Encoding UTF8
+                            Write-Log "CMD: команда на удаление $($paths.Count) эл. у другого ПК (маркер .rm)" "White"
+                        }
+                    }
                 } elseif ($path -eq "/syncpause") {
                     # Пауза фоновой синхронизации: флаг-файл .syncpause в SyncDir
                     # (Scan-SyncDir при виде флага сразу выходит, ничего не отправляя)
@@ -2347,98 +2688,38 @@ function Invoke-WebStatus {
             }
 
             # Общая история: локальные события + другой контур (через status-*.json)
-            $dash = Get-DashboardState
+            $ws = Get-WebStateHtml
+            $rows = [System.Text.StringBuilder]$ws.Rows
+            $progressHtml = $ws.Progress
 
-            # Свежие события сверху
-            $rows = New-Object System.Text.StringBuilder
-            foreach ($ev in $dash.Events) {
-                # Цветовая схема: красный — ошибки, жёлтый — предупреждения,
-                # серый — служебные события (передачи, статусы). Зелёный — только
-                # индикаторы «работает/на связи», не поток событий.
-                $cls = "svc"
-                if ($ev.M -match 'FAIL|FATAL|ERROR|НЕ ПЕРЕДАНО') { $cls = "bad" }
-                elseif ($ev.M -match 'WARNING') { $cls = "warn" }
-                [void]$rows.AppendLine("<tr class='$cls'><td>$($ev.T)</td><td>$([System.Net.WebUtility]::HtmlEncode($ev.M))</td></tr>")
-            }
-
-            # Карточка прогресса: progress-*.json из SyncDir (свой + чужой, уехавший синхронизацией)
-            $progRows = New-Object System.Text.StringBuilder
-            foreach ($pf in @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "progress-*.json" -ErrorAction SilentlyContinue)) {
-                try {
-                    $j = $pf | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
-                    $pct = if ($j.Total -gt 0) { [math]::Min(100, [int](100 * $j.Chunk / $j.Total)) } else { 0 }
-                    $dirTxt = if ($j.Dir -eq "send") { "&rarr; на другой ПК" } else { "&larr; с другого ПК" }
-                    $age = [int]((Get-Date) - [datetime]::ParseExact([string]$j.Started, "yyyy-MM-dd HH:mm:ss", $null)).TotalSeconds
-                    $stale = if ($age -gt 120) { " <span class='sub'>&middot; нет обновлений $age сек</span>" } else { "" }
-                    [void]$progRows.AppendLine("<div class='prow'><div class='ptitle'>${dirTxt}: $([System.Net.WebUtility]::HtmlEncode([string]$j.File)) <span class='sub'>чанк $($j.Chunk)/$($j.Total)$stale</span></div><div class='pbar'><div class='pfill' style='width:$pct%'></div></div></div>")
-                } catch {}
-            }
-            $progressHtml = if ($progRows.Length -gt 0) { "<div class='card' id='progress'>" + $progRows.ToString() + "</div>" } else { "" }
-
-            $watchProcs = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -like "*-File*FileTransfer.ps1*Watch*" })
-            $running = $watchProcs.Count -gt 0
-            # Очередь disk: файлы без отметки SENT/RECEIVED/SNAPSHOT в change.log
-            $queueCount = 0
-            $queueMB = 0.0
-            try {
-                $marked = @{}
-                Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
-                    $p = $_ -split '\|', 3
-                    if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked[$p[2].ToLowerInvariant()] = $true }
-                }
-                foreach ($f in @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
-                    $rel = (Get-RelPath -FullName $f.FullName).ToLowerInvariant()
-                    if (-not $marked[$rel]) { $queueCount++; $queueMB += $f.Length / 1MB }
-                }
-            } catch {}
-            $queueTxt = if ($queueCount -gt 0) { "очередь: <b>$queueCount</b> файл(ов), $([math]::Round($queueMB, 1)) МБ" } else { "очередь пуста" }
-            $paused = Test-Path (Join-Path $script:SyncDir ".syncpause")
-            $pauseBtn = if ($paused) {
-                "<button class='btn tool' onclick=`"post('/syncpause');`">Возобновить синхр.</button>"
-            } else {
-                "<button class='btn tool warn' onclick=`"post('/syncpause');`">Пауза синхр.</button>"
-            }
-            $statusHtml = if ($running) {
-                "<span class='st on'>&#9679; Слушатель работает</span> <span class='sub'>· $queueTxt$(if ($paused) { ' · <b style=''color:#e8c268''>фоновая синхр. на паузе</b>' })</span>" +
-                " <form method='post' action='/stop' style='display:inline' onsubmit=`"return confirm('Остановить слушателя?')`"><button class='btn stop'>Остановить</button></form> $pauseBtn"
-            } else {
-                "<span class='st off'>&#9679; Слушатель ОСТАНОВЛЕН</span> <span class='sub'>· $queueTxt</span> <form method='post' action='/start' style='display:inline'><button class='btn start'>Запустить</button></form> $pauseBtn"
-            }
-            $remoteHtmlCard = if ($dash.RemoteName) {
-                $stateTxt = if ($dash.RemoteAge -lt 120) { "<span class='on'>&#9679; на связи</span>" } else { "<span class='off'>&#9679; молчит > 2 мин</span>" }
-                "<div class='card'><div class='st'>Другой контур: $($dash.RemoteName) — $stateTxt <span class='sub'>статус $($dash.RemoteAge) сек назад</span>" +
-                    "<button class='btn tool' style='margin-left:10px' onclick='location.reload()'>Обновить</button></div></div>"
-            } else {
-                "<div class='card'><div class='st off'>Другой контур: статус неизвестен (status-файл не пришёл)</div></div>"
-            }
-
-            # Панель инструментов: терминал, копирование истории, ZOO, SyncDir, журнал.
-            # Статичный HTML — одинарные кавычки в JS, чтобы не экранировать.
+            # Компактная строка: статусы слушателя и другого контура + все кнопки.
+            # Динамика (статусы, очередь, лог, прогресс) обновляется по /state
+            # без перезагрузки страницы — командер не дёргается.
             $zooDir = Get-IniPath -Section "Tools" -Key "ZooDir" -Default ""
             $zooBtn = ""
             if ($zooDir -and (Test-Path (Join-Path $zooDir "gw-proxy.cmd") -PathType Leaf)) {
                 $zooRunning = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
                     Where-Object { $_.CommandLine -like "*gw-proxy.mjs*" }).Count -gt 0
                 if ($zooRunning) {
-                    $zooBtn = "<button class='btn tool warn' onclick=`"if(confirm('Остановить gw-proxy?')) post('/zoo-stop');`">gw-proxy: остановить</button>"
+                    $zooBtn = "<button class='btn tool warn' onclick=`"if(confirm('Остановить gw-proxy?')) post('/zoo-stop');`">gw-proxy: стоп</button>"
                 } else {
-                    $zooBtn = "<button class='btn tool' onclick=`"post('/zoo');`">gw-proxy: запустить</button>"
+                    $zooBtn = "<button class='btn tool' onclick=`"post('/zoo');`">gw-proxy</button>"
                 }
             }
-            $toolsHtml = "<div class='card toolbar'>" +
+            $statusHtml = "<span id='stListen'>$($ws.Listen)</span><span class='sep'>|</span><span class='sub' id='stRemote'>$($ws.Remote)</span>" +
+                "<button class='btn tool' onclick=`"location.href='/refresh-remote';`">Обновить</button>" +
+                "<span class='sep'>|</span>" +
                 "<button class='btn tool' onclick=`"post('/terminal');`">Терминал</button>" +
                 "<span class='grp'><input id='copyn' type='number' value='10' min='1' max='200' class='num'>" +
-                "<button class='btn tool' onclick=`"copyLog();`">Скопировать события</button></span>" +
-                "<button class='btn tool warn' onclick=`"if(confirm('Перезапустить слушателя?')) post('/restart');`">Рестарт слушат��ля</button>" +
-                "<button class='btn stop' onclick=`"if(confirm('Остановить ВСЕ задания: слушатель, отправки, gw-proxy, хоткеи?')) post('/stopall');`">Стоп все задания</button>" +
+                "<button class='btn tool' onclick=`"copyLog();`">Скоп. события</button></span>" +
+                "<button class='btn tool warn' onclick=`"if(confirm('Перезапустить слушателя?')) post('/restart');`">Рестарт</button>" +
+                "<button class='btn stop' onclick=`"if(confirm('Остановить ВСЕ задания: слушатель, отправки, gw-proxy, хоткеи?')) post('/stopall');`">Стоп все</button>" +
                 $zooBtn +
                 "<button class='btn tool' onclick=`"post('/opensync');`">SyncDir</button>" +
-                "<button class='btn stop' onclick=`"if(confirm('Очистить очередь (локальный SyncDir)? Содержимое уедет в бэкап.')) post('/clearqueue');`">Очистить очередь</button>" +
-                "<button class='btn tool' onclick=`"post('/openlog');`">Журнал (окно)</button>" +
-                "<span id='note' class='sub'></span>" +
-                "</div>"
+                "<button class='btn stop' onclick=`"if(confirm('Очистить очередь (локальный SyncDir)? Содержимое уедет в бэкап.')) post('/clearqueue');`">Очистить</button>" +
+                "<button class='btn tool' onclick=`"post('/openlog');`">Журнал</button>" +
+                "<button class='btn tool' onclick=`"if(confirm('Очистить журнал событий?')) post('/clearlog');`">Очистить лог</button>" +
+                "<span id='note' class='sub'></span>"
 
             $machine = $env:COMPUTERNAME
             # Форма параметров справа от лога: правки [Settings] в setcp.ini
@@ -2462,7 +2743,7 @@ function Invoke-WebStatus {
             # без трогания кода); подстановка — {PLACEHOLDER}-поля.
             $tplPath = Join-Path (Split-Path -Parent $PSCommandPath) "dashboard.html"
             $html = if (Test-Path $tplPath) { Read-TextFile -Path $tplPath } else { "<html><body><h3>dashboard.html не найден рядом с $PSCommandPath</h3></body></html>" }
-            $html = $html.Replace("{MACHINE}", $machine).Replace("{STATUS}", $statusHtml).Replace("{REMOTE_CARD}", $remoteHtmlCard).Replace("{PROGRESS}", $progressHtml).Replace("{TOOLS}", $toolsHtml).Replace("{SETTINGS}", $settingsHtml).Replace("{ROWS}", $rows.ToString())
+            $html = $html.Replace("{MACHINE}", $machine).Replace("{STATUS}", $statusHtml).Replace("{PROGRESS}", $progressHtml).Replace("{SETTINGS}", $settingsHtml).Replace("{ROWS}", $rows.ToString()).Replace("{QUEUE}", $ws.QueueFiles)
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($html)
             $resp.ContentType = "text/html; charset=utf-8"
             $resp.ContentLength64 = $bytes.Length
