@@ -30,6 +30,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#171a21;color:#dfe3ea;di
 .row .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row .sz{color:#8a93a5;font-size:11px;white-space:nowrap}
 .row.dir .nm{color:#e8c268;cursor:pointer}
+.row.dir.cur{background:#33405a}
 .row.file .nm{color:#dfe3ea;cursor:pointer}
 .row .fav{color:#5a6373;cursor:pointer;padding:0 4px}
 .row .fav:hover{color:#e8c268}
@@ -66,7 +67,8 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <div class="cmd">
 <div class="panel">
 <div class="phead"><b>disk (этот ПК)</b>
-<button class='btn tool' onclick="cmd('copy','loc')" title="Отправить отмеченное на другой ПК">Отправить</button>
+<button class='btn tool' onclick="cmd('copy','loc')" title="Копировать отмеченное на другой ПК">Копировать</button>
+<button class='btn tool' onclick="cmd('move','loc')" title="Переместить: копия на другой ПК, оригинал — в бэкап TEMP">Переместить</button>
 <button class='btn stop' onclick="cmd('del','loc')" title="Удалить отмеченное локально (бэкап в TEMP)">Удалить</button>
 <label class="sub"><input type="checkbox" id="selall_loc" onchange="selAll(this,'loc')"> все</label>
 <span class="sub" id="locinfo"></span></div>
@@ -76,7 +78,8 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <div class="panel">
 <div class="phead"><b>Другой ПК</b> <span id="reminfo" class="sub"></span>
 <button class='btn tool' onclick="location.href='/refresh-remote'" title="Обновить список">&#8635;</button>
-<button class='btn tool' onclick="cmd('copy','rem')" title="Отправить отмеченное на этот ПК">Отправить</button>
+<button class='btn tool' onclick="cmd('copy','rem')" title="Копировать отмеченное на этот ПК">Копировать</button>
+<button class='btn tool' onclick="cmd('move','rem')" title="Переместить: копия сюда, у другого ПК — удаление">Переместить</button>
 <button class='btn stop' onclick="cmd('del','rem')" title="Удалить отмеченное у другого ПК">Удалить</button>
 <label class="sub"><input type="checkbox" id="selall_rem" onchange="selAll(this,'rem')"> все</label></div>
 <div class="pbody" id="rembody"></div>
@@ -89,7 +92,7 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <tbody id="logbody">{ROWS}</tbody>
 </table></div>
 <div class="card" style="flex:0 0 30%;display:flex;flex-direction:column;overflow:hidden;margin-bottom:0;padding:6px 10px">
-<div class='sub' style='padding:2px 0'>Очередь disk (не отправлено) <button class='btn tool' style='padding:1px 8px;font-size:11px' onclick="sendAll()">Отправить всё</button></div>
+<div class='sub' style='padding:2px 0'>Очередь disk (не отправлено) <button class='btn tool' style='padding:1px 8px;font-size:11px' onclick="sendAll()">Отправить всё</button> <button class='btn stop' style='padding:1px 8px;font-size:11px' onclick="clearQueue()">Очистить</button></div>
 <div id="queuepanel" style="overflow-y:auto">{QUEUE}</div>
 </div>
 </div>
@@ -115,6 +118,10 @@ function sendAll(){
   fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'panel=loc&op=sendall&paths='})
     .then(function(){ location.reload(); });
 }
+function clearQueue(){
+  if (!confirm('Очистить очередь (локальный disk)? Содержимое уедет в бэкап.')) return;
+  fetch('/clearqueue', {method:'POST'}).then(function(){ location.reload(); });
+}
 function post(p){ fetch(p,{method:'POST'}).then(function(){ location.reload(); }); }
 function note(msg){ var el=document.getElementById('note'); el.textContent=msg; setTimeout(function(){ el.textContent=''; }, 6000); }
 function copyLog(){
@@ -137,42 +144,50 @@ function renderPanel(side, data){
   var cur = getFolder(side);
   var body = document.getElementById(side+'body');
   body.innerHTML = '';
-  // «..» — подъём на уровень вверх (кроме корня)
-  if (cur) {
+  // «..» — подъём на уровень вверх. Локальная панель поднимается до корня
+  // диска C:\ (из disk — в родительскую папку SyncDir), удалёнка — в пределах disk.
+  var isRootDisk = !cur;
+  var atDriveRoot = side === 'loc' && cur === 'C:';
+  if (!atDriveRoot && (!isRootDisk || side === 'loc')) {
     var up = document.createElement('div'); up.className='row dir';
     up.innerHTML = "<span class='ic'>&#8617;</span><span class='nm'>..</span>";
     up.onclick = function(){
-      var pp = cur.split('/'); pp.pop();
-      nav(side, pp.join('/'));
+      var target;
+      if (isRootDisk) { target = parentOfRoot(); }        // из disk — выше SyncDir, к C:\
+      else { var pp = cur.split('/'); pp.pop(); target = pp.join('/'); }
+      nav(side, target);
     };
     body.appendChild(up);
   }
-  // хлебные крошки: клик по сегменту — переход (автообновление сохранит папку)
+  // хлебные крошки: клик по сегменту — переход (автообновление сохранит папку).
+  // Локальная панель: C:/ > CHANGE > disk; вне disk первый сегмент — корень диска.
   var cr = document.createElement('div'); cr.className='crumb';
   var parts = cur ? cur.split('/') : [];
-  var h = "<a onclick=\"nav('"+side+"','')\">disk/</a>";
+  var h;
+  if (!cur) h = "<a onclick=\"nav('"+side+"','')\">disk/</a>";
+  else if (side === 'loc') h = "<a onclick=\"nav('"+side+"','C:')\">C:/</a>";
+  else h = "<a onclick=\"nav('"+side+"','')\">disk/</a>";
   var acc = '';
   for (var i=0;i<parts.length;i++){ acc += (acc?'/':'')+parts[i];
-    h += " <a onclick=\"nav('"+side+"','"+acc+"')\">"+parts[i]+"/</a>"; }
+    var label = (side === 'loc' && parts[i] === 'C:') ? 'C:/' : parts[i]+'/';
+    h += " <a onclick=\"nav('"+side+"','"+acc+"')\">"+label+"</a>"; }
   cr.innerHTML = h;
   body.appendChild(cr);
-  // избранное этой панели: ★ папка · клик — переход, ✕ — убрать
+  // избранное этой панели: ★ папка · клик — переход, ✕ — убрать (строка видна всегда)
   var favs = getFav().filter(function(x){ return x.side === side; });
-  if (favs.length) {
-    var fh = document.createElement('div'); fh.className='crumb'; fh.style.paddingBottom='4px';
-    fh.innerHTML = "<span class='sub'>&#9733; </span>";
-    getFav().forEach(function(x){
-      if (x.side !== side) return;
-      var a = document.createElement('a'); a.style.cursor='pointer'; a.title=x.rel;
-      a.textContent = x.rel.split('/').pop() || x.rel;
-      a.onclick = function(){ nav(side, x.rel); };
-      fh.appendChild(a);
-      var del = document.createElement('a'); del.textContent='\u2715'; del.style.cursor='pointer'; del.title='Убрать';
-      del.onclick = function(e){ e.stopPropagation(); delFav(getFav().indexOf(x)); renderAll(); };
-      fh.appendChild(del); fh.appendChild(document.createTextNode('  '));
-    });
-    body.appendChild(fh);
-  }
+  var fh = document.createElement('div'); fh.className='crumb'; fh.style.paddingBottom='4px';
+  fh.innerHTML = "<span class='sub'>&#9733; Избранное: </span>";
+  if (!favs.length) fh.innerHTML += "<span class='sub'>пусто — ☆ у папки добавляет</span>";
+  favs.forEach(function(x){
+    var a = document.createElement('a'); a.style.cursor='pointer'; a.title=x.rel;
+    a.textContent = x.rel.split('/').pop() || x.rel;
+    a.onclick = function(){ nav(side, x.rel); };
+    fh.appendChild(a);
+    var del = document.createElement('a'); del.textContent='\u2715'; del.style.cursor='pointer'; del.title='Убрать';
+    del.onclick = function(e){ e.stopPropagation(); delFav(getFav().indexOf(x)); renderAll(); };
+    fh.appendChild(del); fh.appendChild(document.createTextNode('  '));
+  });
+  body.appendChild(fh);
   // entries текущей папки
   var dirs = {}, files = [];
   for (var i=0;i<data.length;i++){
@@ -190,8 +205,8 @@ function renderPanel(side, data){
     var r = document.createElement('div'); r.className='row dir';
     r.innerHTML = "<span class='ic'>&#128193;</span><span class='nm'></span><span class='fav' title='В избранное'>&#9734;</span>";
     r.querySelector('.nm').textContent = d;
-    r.onclick = function(){ setFolder(side, cur ? cur+'/'+d : d); renderAll(); };
     var fpath = cur ? cur+'/'+d : d;
+    r.onclick = function(){ nav(side, fpath); };
     r.querySelector('.fav').onclick = function(e){ e.stopPropagation(); addFav(side, fpath); };
     body.appendChild(r);
   });
@@ -209,7 +224,10 @@ function renderPanel(side, data){
     body.appendChild(r);
   });
 }
-function nav(side, p){ setFolder(side, p); renderAll(); }
+function nav(side, p){
+  setFolder(side, p);
+  if (side === 'loc') { loadLoc(); } else { renderPanel('rem', REM||[]); }
+}
 // ===== ИЗБРАННОЕ (localStorage) =====
 function getFav(){ try { return JSON.parse(localStorage.getItem('cp.fav') || '[]'); } catch(e){ return []; } }
 function setFav(f){ try { localStorage.setItem('cp.fav', JSON.stringify(f)); } catch(e){} }
@@ -235,17 +253,28 @@ function renderFav(){
     body.appendChild(r);
   });
 }
-var LOC=null, REM=null;
+var LOC=null, REM=null, SYNCROOT='';
+// Родитель корня disk за пределами SyncDir: C:\CHANGE\disk -> C:/CHANGE
+function parentOfRoot(){
+  var n = (SYNCROOT||'').replace(/\\/g,'/').replace(/\/+$/,'');
+  var i = n.lastIndexOf('/');
+  return i > 0 ? n.slice(0, i) : 'C:';
+}
 function renderAll(){
   renderPanel('loc', LOC||[]);
   renderPanel('rem', REM||[]);
 }
-function loadPanels(){
-  fetch('/files?panel=local').then(function(r){return r.json();}).then(function(j){
+function loadLoc(){
+  // Левая панель при каждом переходе запрашивает содержимое текущей папки:
+  // кэша за пределами disk нет, без refetch список пуст до F5
+  fetch('/files?panel=local&path=' + encodeURIComponent(getFolder('loc'))).then(function(r){return r.json();}).then(function(j){
     LOC = j.files||[];
+    SYNCROOT = (j.root||'').replace(/\\/g,'/').replace(/\/+$/,'');
     var mi = document.getElementById('locinfo'); if (mi) mi.textContent = (LOC.length>=3000?'3000+':LOC.length)+' эл.';
     renderPanel('loc', LOC);
   });
+}
+function loadRem(){
   fetch('/files?panel=remote').then(function(r){return r.json();}).then(function(j){
     REM = j.files || [];
     var mi = document.getElementById('reminfo');
@@ -253,6 +282,7 @@ function loadPanels(){
     renderPanel('rem', REM);
   }).catch(function(){ var mi=document.getElementById('reminfo'); if (mi) mi.textContent='нет данных'; renderPanel('rem', []); });
 }
+function loadPanels(){ loadLoc(); loadRem(); }
 function selAll(chk, side){
   var body = document.getElementById(side+'body');
   body.querySelectorAll('input[type=checkbox]').forEach(function(c){ c.checked = chk.checked; });
@@ -266,8 +296,10 @@ function checkedPaths(side){
 function cmd(op, side){
   var paths = checkedPaths(side);
   if (!paths.length) { note('Ничего не отмечено'); return; }
-  var what = op==='copy' ? (side==='loc' ? 'Отправить отмеченное на другой ПК' : 'Запросить отмеченное у другого ПК')
-                         : (side==='loc' ? 'Удалить отмеченное локально (бэкап в TEMP)' : 'Удалить отмеченное у другого ПК');
+  var what;
+  if (op === 'copy')      what = side==='loc' ? 'Копировать отмеченное на другой ПК' : 'Запросить отмеченное у другого ПК';
+  else if (op === 'move') what = side==='loc' ? 'Переместить: копия на другой ПК, оригинал — в бэкап TEMP' : 'Переместить: копия сюда, у другого ПК будет удалено';
+  else                    what = side==='loc' ? 'Удалить отмеченное локально (бэкап в TEMP)' : 'Удалить отмеченное у другого ПК';
   if (!confirm(what + ' ('+paths.length+' эл.)?')) return;
   var body = 'panel='+encodeURIComponent(side)+'&op='+encodeURIComponent(op)+'&paths='+encodeURIComponent(paths.join('\n'));
   fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body})

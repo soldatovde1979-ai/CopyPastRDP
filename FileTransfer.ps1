@@ -1376,24 +1376,34 @@ function Scan-SyncDir {
     # (запросить перечисленное у приёмника). Создаются дашбордом, уезжают
     # обычным порядком (стандартная отправка, пометка SENT); применяются
     # только на ПРИЁМЕ (RECEIVED) - свой маркер контур не исполняет.
-    foreach ($mk in @('.rm', '.get')) {
+    foreach ($mk in @('.get', '.rm', '.mv')) {
         $mkPath = Join-Path $script:SyncDir $mk
         if (-not (Test-Path -LiteralPath $mkPath -PathType Leaf)) { continue }
+        # .mv в фазе 2 (пометка PHASE2): проверка передачи и удаление оригиналов
+        # выполняется на каждом скане до полного исполнения
+        if ($mk -eq '.mv' -and ((Get-Content -LiteralPath $mkPath -Encoding UTF8 -TotalCount 1 -ErrorAction SilentlyContinue) -eq 'PHASE2')) {
+            if (Apply-SyncMarker -Path $mkPath -Mode 'mv') {
+                Remove-Item -LiteralPath $mkPath -Force -ErrorAction SilentlyContinue
+                [void](Remove-ChangeEntries -RelPaths @($mk))
+            }
+            continue
+        }
         $mkItem = Get-Item -LiteralPath $mkPath -Force -ErrorAction SilentlyContinue
         if (-not $mkItem) { continue }
         $mkKey = Get-SyncKey -Item $mkItem -RelPath $mk
         $mkStatus = if ($script:ChangeLog.ContainsKey($mkKey)) { $script:ChangeLog[$mkKey] } else { "" }
         if ($mkStatus -eq 'RECEIVED') {
-            Apply-SyncMarker -Path $mkPath -Mode $mk.TrimStart('.')
-            Remove-Item -LiteralPath $mkPath -Force -ErrorAction SilentlyContinue
-            [void](Remove-ChangeEntries -RelPaths @($mk))
+            if (Apply-SyncMarker -Path $mkPath -Mode $mk.TrimStart('.')) {
+                Remove-Item -LiteralPath $mkPath -Force -ErrorAction SilentlyContinue
+                [void](Remove-ChangeEntries -RelPaths @($mk))
+            }
         }
     }
 
-    # Служебные файлы не отправляются: сам журнал change.log, маркер удаления .del,
+    # Служебные файлы не отправляются: сам журнал change.log, маркеры .del/.rm/.get/.mv,
     # незавершённые сборки .part и пакетные архивы .synczip (отправляются отдельно)
     $files       = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ine 'change.log' -and $_.Name -ine '.del' -and $_.Name -ine '.syncpause' -and $_.Extension -ne '.part' -and $_.Extension -ne '.synczip' })
+        Where-Object { $_.Name -ine 'change.log' -and $_.Name -ne '.del' -and $_.Name -notin @('.rm', '.get', '.mv') -and $_.Name -ne '.syncpause' -and $_.Extension -ne '.part' -and $_.Extension -ne '.synczip' })
 
     # Папки и файлы к отправке (сначала сбор_pending, затем решение: batch или по одному)
     $dirs = @(Get-ChildItem -Path $script:SyncDir -Directory -Recurse -ErrorAction SilentlyContinue)
@@ -1704,7 +1714,7 @@ function Watch-Clipboard {
                         $mRel = Get-RelPath -FullName $_.FullName
                         if (-not $mRel) { return }
                         if ($_.PSIsContainer) { "$mRel|0|d" }
-                        elseif ($_.Name -in @('change.log', '.del', '.rm', '.get', '.syncpause') -or $_.Extension -in @('.part', '.synczip')) { return }
+                        elseif ($_.Name -in @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -or $_.Extension -in @('.part', '.synczip')) { return }
                         elseif ($_.Name -match '^(status|progress)-') { return }
                         else { "$mRel|$($_.Length)|f" }
                     })
@@ -1945,24 +1955,53 @@ function Backup-SyncItem {
 }
 
 function Apply-SyncMarker {
-    # Применение полученного маркера .rm (удалить перечисленное локально) или
-    # .get (перечисленное отправить заново - снимаются отметки change.log).
+    # Применение полученного маркера: .rm (удалить перечисленное локально),
+    # .get (перечисленное отправить заново - снимаются отметки change.log),
+    # .mv (переместить: отправить перечисленное, затем удалить оригиналы).
     # Применяется только на ПРИЁМЕ: свой маркер контур не исполняет.
+    # Возвращает $true, если маркер исполнен полностью (его можно удалить).
     param([string]$Path, [string]$Mode)
     $paths = New-Object System.Collections.Generic.List[string]
     foreach ($l in @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue)) {
         $rel = ($l.Trim() -replace '\\', '/').Trim('/')
-        if (-not $rel -or $rel -match '\.\.' -or $rel -in @('change.log', '.del', '.rm', '.get', '.syncpause')) { continue }
+        if (-not $rel -or $rel -match '\.\.' -or $rel -eq 'PHASE2' -or $rel -in @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause')) { continue }
         if (Resolve-SyncPath -Rel $rel) { $paths.Add($rel) }
     }
-    if ($paths.Count -eq 0) { return }
+    if ($paths.Count -eq 0) { return $true }
     if ($Mode -eq 'rm') {
         foreach ($rel in $paths) { Backup-SyncItem -Rel $rel }
         [void](Remove-ChangeEntries -RelPaths $paths.ToArray())
         Write-Log "CMD: .rm применён - удалено $($paths.Count) эл. (бэкап в TEMP)" "White"
+        return $true
+    }
+    if ($Mode -eq 'mv') {
+        # Перемещение в два шага (маркер живёт у приёмника, пока не исполнен).
+        # Фаза 1: снять отметки - перечисленные файлы уедут заново; маркер
+        # перезаписывается пометкой PHASE2. Фаза 2: у всех путей есть отметка
+        # SENT (или путь исчез) - оригиналы переносятся в бэкап TEMP.
+        $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue)
+        if ($lines.Count -gt 0 -and $lines[0] -eq 'PHASE2') {
+            foreach ($rel in $paths) {
+                $done = $false
+                $prefix = $rel.ToLowerInvariant() + "|"
+                foreach ($k in $script:ChangeLog.Keys) {
+                    if ($k.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and $script:ChangeLog[$k] -in @('SENT', 'RECEIVED')) { $done = $true; break }
+                }
+                if (-not $done -and -not (Test-Path -LiteralPath (Join-Path $script:SyncDir ($rel -replace '/', '\')))) { $done = $true }
+                if (-not $done) { return $false }
+            }
+            foreach ($rel in $paths) { Backup-SyncItem -Rel $rel }
+            Write-Log "CMD: .mv применён - удалено $($paths.Count) эл. после передачи (бэкап в TEMP)" "White"
+            return $true
+        }
+        [void](Remove-ChangeEntries -RelPaths $paths.ToArray())
+        Set-Content -LiteralPath $Path -Value (@('PHASE2') + @($paths)) -Encoding UTF8
+        Write-Log "CMD: .mv - отправляю $($paths.Count) эл., после передачи оригиналы будут удалены" "White"
+        return $false
     } else {
         [void](Remove-ChangeEntries -RelPaths $paths.ToArray())
         Write-Log "CMD: .get применён - помечено к отправке $($paths.Count) эл." "White"
+        return $true
     }
 }
 
@@ -1975,7 +2014,7 @@ function Get-SyncFileList {
         $rel = Get-RelPath -FullName $item.FullName
         if (-not $rel) { continue }
         if ($item.PSIsContainer) { $list.Add("$rel|0|d"); continue }
-        if ($item.Name -in @('change.log', '.del', '.rm', '.get', '.syncpause') -or $item.Extension -in @('.part', '.synczip')) { continue }
+        if ($item.Name -in @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -or $item.Extension -in @('.part', '.synczip')) { continue }
         if ($item.Name -match '^(status|progress)-') { continue }
         $list.Add("$rel|$($item.Length)|f")
     }
@@ -1985,15 +2024,22 @@ function Get-SyncFileList {
 function Start-SendNow {
     # Запуск прямой отправки: список путей -> временный файл -> скрытый процесс
     # SendNow. Web-процесс не блокируется, окна не мелькают. Возвращает пути.
-    param([string[]]$Files)
-    $clean = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
-    if ($clean.Count -eq 0) { return $null }
+    # RelHints (необязательно): явные относительные пути приёмника (i-в-i с Files).
+    param([string[]]$Files, [string[]]$RelHints = @())
+    $lines = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $Files.Count; $i++) {
+        $p = $Files[$i]
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        $hint = if ($i -lt $RelHints.Count) { $RelHints[$i] } else { "" }
+        if ($hint) { $lines.Add("$p`t$hint") } else { $lines.Add($p) }
+    }
+    if ($lines.Count -eq 0) { return $null }
     $listFile = Join-Path $env:TEMP ("cp-sendnow-{0}.txt" -f ([guid]::NewGuid().ToString("N").Substring(0, 8)))
-    Set-Content -LiteralPath $listFile -Value $clean -Encoding UTF8
+    Set-Content -LiteralPath $listFile -Value $lines -Encoding UTF8
     Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" SendNow `"$listFile`"" `
         -WorkingDirectory (Split-Path -Parent $PSCommandPath) | Out-Null
-    return $clean
+    return $lines
 }
 
 function Invoke-SendNow {
@@ -2014,16 +2060,23 @@ function Invoke-SendNow {
     $script:SyncAckTimeoutSec = $script:SyncAckFastSec
 
     $ok = 0; $fail = 0
-    foreach ($p in $paths) {
-        $p = $p.Trim()
+    foreach ($line in $paths) {
+        # Формат строки: "путь" или "путь<TAB>явный rel-путь приёмника"
+        $parts = $line -split "`t", 2
+        $p = $parts[0].Trim()
+        $relHint = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { Write-Log "SENDNOW: не найден '$p'" "Yellow"; $fail++; continue }
         $f = Get-Item -LiteralPath $p -Force
-        # RelPath — только для файлов внутри SyncDir (структура сохранится);
-        # внешние файлы уходят по имени — приёмник разложит их по [Routes]
+        # RelPath — явный (перемещение) или для файлов внутри SyncDir
+        # (структура сохранится); внешние файлы уходят по имени — приёмник
+        # разложит их по [Routes]
         $rel = ""
         $root = [System.IO.Path]::GetFullPath($script:SyncDir).TrimEnd('\')
         $full = [System.IO.Path]::GetFullPath($f.FullName)
-        if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        if ($relHint) {
+            $rel = $relHint
+        }
+        elseif ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
             $rel = $full.Substring($root.Length + 1)
         }
         if (Send-FileInChunks -File $f -RelPath $rel) { $ok++ } else { $fail++ }
@@ -2361,10 +2414,15 @@ function Get-WebStateHtml {
         $marked = @{}
         Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
             $p = $_ -split '\|', 3
-            if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked[$p[2].ToLowerInvariant()] = $true }
+            if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) {
+                $marked[$p[2].ToLowerInvariant()] = $true
+                # голый путь без размера/ticks — для lookup по rel
+                $relOnly = ($p[2] -split '\|')[0]
+                $marked[$relOnly.ToLowerInvariant()] = $true
+            }
         }
         foreach ($f in @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
+            Where-Object { $_.Name -notin @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
             $rel = (Get-RelPath -FullName $f.FullName).ToLowerInvariant()
             if (-not $marked[$rel]) { $queueCount++; $queueMB += $f.Length / 1MB }
         }
@@ -2388,11 +2446,15 @@ function Get-WebStateHtml {
         $marked2 = @{}
         Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
             $p = $_ -split '\|', 3
-            if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked2[$p[2].ToLowerInvariant()] = $true }
+            if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) {
+                $marked2[$p[2].ToLowerInvariant()] = $true
+                $relOnly2 = ($p[2] -split '\|')[0]
+                $marked2[$relOnly2.ToLowerInvariant()] = $true
+            }
         }
         $shown = 0
         foreach ($f in @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
+            Where-Object { $_.Name -notin @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' })) {
             $rel = (Get-RelPath -FullName $f.FullName).ToLowerInvariant()
             if ($marked2[$rel]) { continue }
             $shown++
@@ -2483,12 +2545,27 @@ function Invoke-WebStatus {
                 continue
             }
             if ($path -eq "/files") {
-                # Список файлов для панелей командера: panel=local (SyncDir) или
-                # panel=remote (манифест из status-*.json, кэш до /refresh-remote)
+                # Список файлов для панелей командера: panel=local (SyncDir или
+                # любая папка диска через &path=) или panel=remote (манифест из
+                # status-*.json, кэш до /refresh-remote)
                 $panel = [string]$ctx.Request.QueryString["panel"]
                 $resp.ContentType = "application/json; charset=utf-8"
                 if ($panel -eq "local") {
-                    $j = @{ ok = $true; files = @(Get-SyncFileList); root = $script:SyncDir }
+                    # path пуст -> корень disk; "C:/..." -> листинг реальной папки
+                    # диска (навигация командера до корня C:\)
+                    $sub = [string]$ctx.Request.QueryString["path"]
+                    $sub = ($sub -replace '/', '\').TrimEnd('\')
+                    if ($sub -match '^[A-Za-z]:$') { $sub += '\' }
+                    if ($sub -and $sub -match '^[A-Za-z]:\\' -and $sub -notmatch '\.\.' -and (Test-Path -LiteralPath $sub -PathType Container)) {
+                        $entries = New-Object System.Collections.Generic.List[string]
+                        foreach ($it in @(Get-ChildItem -LiteralPath $sub -Force -ErrorAction SilentlyContinue | Select-Object -First 3000)) {
+                            $rel = ($it.FullName -replace '\\', '/')
+                            if ($it.PSIsContainer) { $entries.Add("$rel|0|d") } else { $entries.Add("$rel|$($it.Length)|f") }
+                        }
+                        $j = @{ ok = $true; files = $entries; root = $sub }
+                    } else {
+                        $j = @{ ok = $true; files = @(Get-SyncFileList); root = $script:SyncDir }
+                    }
                 } else {
                     if (-not $script:RemoteFilesCache) {
                         try {
@@ -2544,9 +2621,16 @@ function Invoke-WebStatus {
                 continue
             }
             if ($path -eq "/open") {
-                # Открыть файл/папку из SyncDir по щелчку в командере (только внутри SyncDir)
+                # Открыть файл/папку по щелчку в командере: внутри SyncDir (rel) или
+                # по абсолютному пути диска (навигация до корня C:\)
                 $rel = [string]$ctx.Request.QueryString["rel"]
-                $full = Resolve-SyncPath -Rel $rel
+                $full = $null
+                if ($rel -match '^[A-Za-z]:') {
+                    $cand = ($rel -replace '/', '\')
+                    if ($cand -notmatch '\.\.') { $full = $cand }
+                } else {
+                    $full = Resolve-SyncPath -Rel $rel
+                }
                 if ($full -and (Test-Path -LiteralPath $full)) {
                     if (Test-Path -LiteralPath $full -PathType Container) {
                         Start-Process -FilePath "explorer.exe" -ArgumentList "`"$full`""
@@ -2715,7 +2799,7 @@ function Invoke-WebStatus {
                     $paths = @($kv['paths'] -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
                         ForEach-Object { ($_ -replace '\\', '/').Trim('/') } | Where-Object { $_ -and $_ -notmatch '\.\.' })
                     $paths = @($paths | Select-Object -Unique)
-                    if (($paths.Count -gt 0 -or ($panel -eq 'loc' -and $op -eq 'sendall')) -and $panel -in @('loc', 'rem') -and $op -in @('copy', 'del', 'sendall')) {
+                    if (($paths.Count -gt 0 -or ($panel -eq 'loc' -and $op -eq 'sendall')) -and $panel -in @('loc', 'rem') -and $op -in @('copy', 'del', 'sendall', 'move')) {
                         if ($panel -eq 'loc' -and $op -eq 'sendall') {
                             # Отправить всё: вся очередь уходит ПРЯМОЙ отправкой (SendNow) -
                             # приёмник разложит по [Routes], диск не задействован
@@ -2724,30 +2808,72 @@ function Invoke-WebStatus {
                                 $marked3 = @{}
                                 Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
                                     $p = $_ -split '\|', 3
-                                    if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked3[$p[2].ToLowerInvariant()] = $true }
+                                    if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) {
+                                        $marked3[$p[2].ToLowerInvariant()] = $true
+                                        $relOnly3 = ($p[2] -split '\|')[0]
+                                        $marked3[$relOnly3.ToLowerInvariant()] = $true
+                                    }
                                 }
                                 $all = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
-                                    Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' } |
+                                    Where-Object { $_.Name -notin @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' } |
                                     ForEach-Object { $rel = Get-RelPath -FullName $_.FullName; if (-not $marked3[$rel.ToLowerInvariant()]) { $_.FullName } })
                             } catch {}
                             if ($all.Count -gt 0) { Start-SendNow -FileList $all }
                             else { Write-Log "CMD: очередь пуста" "White" }
                         } elseif ($panel -eq 'loc' -and $op -eq 'copy') {
                             # Прямая отправка отмеченного мимо disk: приёмник разложит
-                            # по [Routes] (папка назначения по шаблону) или в InDir
-                            $abs = @($paths | ForEach-Object { Resolve-SyncPath -Rel $_ } | Where-Object { $_ })
+                            # по [Routes] (папка назначения по шаблону) или в InDir.
+                            # Абсолютные пути диска (навигация до C:\) уходят как есть.
+                            $abs = @($paths | ForEach-Object {
+                                if ($_ -match '^[A-Za-z]:') { $_ -replace '/', '\' }
+                                else { Resolve-SyncPath -Rel $_ }
+                            } | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
                             if (Start-SendNow -FileList $abs) { Write-Log "CMD: отправляется $($abs.Count) эл. (прямая отправка)" "White" }
                         } elseif ($panel -eq 'loc' -and $op -eq 'del') {
-                            foreach ($rel in $paths) { Backup-SyncItem -Rel $rel }
+                            foreach ($rel in $paths) {
+                                if ($rel -match '^[A-Za-z]:') { Write-Log "CMD: '$rel' вне disk — удаление запрещено" "Yellow"; continue }
+                                Backup-SyncItem -Rel $rel
+                            }
                             [void](Remove-ChangeEntries -RelPaths $paths)
                             Write-Log "CMD: удалено локально $($paths.Count) эл. (бэкап в TEMP)" "White"
+                        } elseif ($panel -eq 'loc' -and $op -eq 'move') {
+                            # Переместить: копии уезжают SendNow (rel сохраняется -
+                            # структура папок на приёмнике та же), оригиналы внутри
+                            # disk переносятся в бэкап TEMP
+                            $stage = Join-Path $env:TEMP ("CHANGE-move-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+                            New-Item -ItemType Directory -Path $stage -Force | Out-Null
+                            $staged = @(); $hints = @(); $inside = @()
+                            foreach ($rel in $paths) {
+                                $isAbs = $rel -match '^[A-Za-z]:'
+                                $src = if ($isAbs) { $rel -replace '/', '\' } else { Resolve-SyncPath -Rel $_ }
+                                if (-not $src -or -not (Test-Path -LiteralPath $src)) { continue }
+                                $stagedPath = Join-Path $stage (Split-Path -Leaf $src)
+                                Copy-Item -LiteralPath $src -Destination $stagedPath -Force
+                                $staged += $stagedPath
+                                if ($isAbs) { $hints += "" } else { $hints += $rel; $inside += $rel }
+                            }
+                            if ($staged.Count -gt 0) {
+                                [void](Start-SendNow -FileList $staged -RelHints $hints)
+                                foreach ($rel in $inside) { Backup-SyncItem -Rel $rel }
+                                [void](Remove-ChangeEntries -RelPaths $inside)
+                                Write-Log "CMD: перемещается $($staged.Count) эл. (оригиналы - в бэкап TEMP)" "White"
+                            }
                         } elseif ($panel -eq 'rem' -and $op -eq 'copy') {
                             # Запросить файлы у другого ПК: маркер .get уедет синхронизацией,
-                            # приёмник снимет у себя отметки и отправит перечисленное
+                            # приёмник снимет у себя отметки и отправит перечисленное.
+                            # SendNow ускоряет доставку маркера (мимо сторожа простоя).
                             Set-Content -LiteralPath (Join-Path $script:SyncDir ".get") -Value ($paths -join "`r`n") -Encoding UTF8
+                            [void](Start-SendNow -FileList @((Join-Path $script:SyncDir ".get")))
                             Write-Log "CMD: запрошено у другого ПК $($paths.Count) эл. (маркер .get)" "White"
+                        } elseif ($panel -eq 'rem' -and $op -eq 'move') {
+                            # Переместить: .mv у приёмника отправит перечисленное и удалит
+                            # оригиналы после подтверждённой передачи (бэкап в TEMP)
+                            Set-Content -LiteralPath (Join-Path $script:SyncDir ".mv") -Value ($paths -join "`r`n") -Encoding UTF8
+                            [void](Start-SendNow -FileList @((Join-Path $script:SyncDir ".mv")))
+                            Write-Log "CMD: перемещение $($paths.Count) эл. у другого ПК (маркер .mv)" "White"
                         } elseif ($panel -eq 'rem' -and $op -eq 'del') {
                             Set-Content -LiteralPath (Join-Path $script:SyncDir ".rm") -Value ($paths -join "`r`n") -Encoding UTF8
+                            [void](Start-SendNow -FileList @((Join-Path $script:SyncDir ".rm")))
                             Write-Log "CMD: команда на удаление $($paths.Count) эл. у другого ПК (маркер .rm)" "White"
                         }
                     }
