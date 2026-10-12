@@ -396,18 +396,20 @@ function Send-FileInChunks {
 
             $clipOk = $false
             $attempts = $script:ClipRetryAttempts
+            $clipErr = ""
             while ($attempts -gt 0 -and -not $clipOk) {
                 try {
                     [System.Windows.Forms.Clipboard]::SetText($json)
                     $clipOk = $true
                 } catch {
+                    $clipErr = $_.Exception.Message
                     $attempts--
                     Start-Sleep -Milliseconds $script:ClipRetryDelayMs
                 }
             }
 
             if (-not $clipOk) {
-                Write-Log "FATAL: Cannot write chunk $chunkIndex/$totalChunks to clipboard!" "Red"
+                Write-Log "FATAL: Cannot write chunk $chunkIndex/$totalChunks to clipboard! ($clipErr)" "Red"
                 $script:HasError = $true
                 Write-Progress -Activity $script:ProgressActivity -Completed -ErrorAction SilentlyContinue
                 Clear-ProgressState
@@ -1980,6 +1982,56 @@ function Get-SyncFileList {
     return $list
 }
 
+function Start-SendNow {
+    # Запуск прямой отправки: список путей -> временный файл -> скрытый процесс
+    # SendNow. Web-процесс не блокируется, окна не мелькают. Возвращает пути.
+    param([string[]]$Files)
+    $clean = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    if ($clean.Count -eq 0) { return $null }
+    $listFile = Join-Path $env:TEMP ("cp-sendnow-{0}.txt" -f ([guid]::NewGuid().ToString("N").Substring(0, 8)))
+    Set-Content -LiteralPath $listFile -Value $clean -Encoding UTF8
+    Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" SendNow `"$listFile`"" `
+        -WorkingDirectory (Split-Path -Parent $PSCommandPath) | Out-Null
+    return $clean
+}
+
+function Invoke-SendNow {
+    # FileTransfer.ps1 SendNow -FileList <файл со списком путей>
+    # ПРЯМАЯ отправка файлов на другой ПК в обход disk: каждый файл уходит
+    # чанками через буфер, приёмник кладёт его по [Routes] (папка назначения
+    # по шаблону) или в InDir, если маски нет. Клик пользователя в командере —
+    # это явное действие: сторож простоя и окна простоя не задерживают отправку,
+    # буфер сохраняется/восстанавливается штатным Save/Restore.
+    param([string]$ListFile)
+    Add-Type -AssemblyName System.Windows.Forms
+    $paths = @(Get-Content -LiteralPath $ListFile -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
+    Remove-Item -LiteralPath $ListFile -Force -ErrorAction SilentlyContinue
+    if ($paths.Count -eq 0) { Write-Log "SENDNOW: пустой список" "Yellow"; return }
+
+    # Быстрый ACK (как у фоновой синхронизации): живой приёмник забирает чанк
+    # за 1-3 сек; приёмник недоступен — не ждём 60 сек
+    $script:SyncAckTimeoutSec = $script:SyncAckFastSec
+
+    $ok = 0; $fail = 0
+    foreach ($p in $paths) {
+        $p = $p.Trim()
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { Write-Log "SENDNOW: не найден '$p'" "Yellow"; $fail++; continue }
+        $f = Get-Item -LiteralPath $p -Force
+        # RelPath — только для файлов внутри SyncDir (структура сохранится);
+        # внешние файлы уходят по имени — приёмник разложит их по [Routes]
+        $rel = ""
+        $root = [System.IO.Path]::GetFullPath($script:SyncDir).TrimEnd('\')
+        $full = [System.IO.Path]::GetFullPath($f.FullName)
+        if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+            $rel = $full.Substring($root.Length + 1)
+        }
+        if (Send-FileInChunks -File $f -RelPath $rel) { $ok++ } else { $fail++ }
+    }
+    Write-Log "SENDNOW: готово — отправлено $ok, не удалось $fail $(if ($fail -gt 0) { '(приёмник недоступен?)' })" "White"
+    Write-Log "SENDNOW: завершено" "White"
+}
+
 function Invoke-Resend {
     # FileTransfer.ps1 Resend [маска1 маска2 ...] - стереть записи change.log,
     # чтобы файлы (все или по маскам) были отправлены заново при следующем скане.
@@ -2444,9 +2496,9 @@ function Invoke-WebStatus {
                                 Where-Object { $_.Name -ine "status-$env:COMPUTERNAME.json" } | Select-Object -First 1)
                             if ($rf) {
                                 $j0 = $rf[0] | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
-                                $script:RemoteFilesCache = @($j.Files)
-                                $script:RemoteFilesMachine = [string]$j.Machine
-                                $script:RemoteFilesTime = [string]$j.Time
+                                $script:RemoteFilesCache = @($j0.Files)
+                                $script:RemoteFilesMachine = [string]$j0.Machine
+                                $script:RemoteFilesTime = [string]$j0.Time
                             }
                         } catch {}
                     }
@@ -2507,6 +2559,43 @@ function Invoke-WebStatus {
                 continue
             }
             if ($ctx.Request.HttpMethod -eq "POST") {
+                if ($path -eq "/sendnow") {
+                    # Прямая отправка произвольных файлов мимо disk: содержимое
+                    # уходит сразу (SendNow), приёмник разложит по [Routes]
+                    try {
+                        $ms = New-Object System.IO.MemoryStream
+                        $ctx.Request.InputStream.CopyTo($ms)
+                        if ($ms.Length -gt 128MB) {
+                            $ms.Close(); $ms.Dispose()
+                            $resp.StatusCode = 413
+                            $b = [System.Text.Encoding]::UTF8.GetBytes("файл слишком велик (>96 МБ) — отправьте через SyncDir")
+                            $resp.ContentType = "text/plain; charset=utf-8"
+                            $resp.ContentLength64 = $b.Length
+                            $resp.OutputStream.Write($b, 0, $b.Length)
+                            $resp.OutputStream.Close()
+                            continue
+                        }
+                        $body = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+                        $ms.Close(); $ms.Dispose()
+                        $j = $body | ConvertFrom-Json
+                        $safeName = [System.IO.Path]::GetFileName([string]$j.Name)
+                        if ($safeName) {
+                            $tmpDir = Join-Path $env:TEMP "CHANGE-send"
+                            if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null }
+                            $tmpPath = Join-Path $tmpDir "$safeName"
+                            [System.IO.File]::WriteAllBytes($tmpPath, [Convert]::FromBase64String([string]$j.Data))
+                            $spawned = Start-SendNow -FileList @($tmpPath)
+                            if ($spawned) { Write-Log "SENDNOW: '$safeName' ($([math]::Round((Get-Item $tmpPath).Length / 1MB, 2)) МБ) — прямая отправка" "White" }
+                        }
+                        $resp.StatusCode = 200
+                        $b = [System.Text.Encoding]::UTF8.GetBytes("ok")
+                        $resp.OutputStream.Write($b, 0, $b.Length)
+                    } catch {
+                        try { $resp.StatusCode = 500 } catch {}
+                    }
+                    $resp.OutputStream.Close()
+                    continue
+                }
                 if ($path -eq "/drop") {
                     # Drag&drop из браузера: JSON {name, data(base64)} → файл в SyncDir →
                     # синхронизация доставит на другой контур
@@ -2628,14 +2717,26 @@ function Invoke-WebStatus {
                     $paths = @($paths | Select-Object -Unique)
                     if (($paths.Count -gt 0 -or ($panel -eq 'loc' -and $op -eq 'sendall')) -and $panel -in @('loc', 'rem') -and $op -in @('copy', 'del', 'sendall')) {
                         if ($panel -eq 'loc' -and $op -eq 'sendall') {
-                            # Отправить всё: change.log обнуляется - весь disk уедет заново
-                            Set-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Value "" -Encoding UTF8
-                            Write-Log "CMD: вся очередь помечена к отправке заново" "White"
+                            # Отправить всё: вся очередь уходит ПРЯМОЙ отправкой (SendNow) -
+                            # приёмник разложит по [Routes], диск не задействован
+                            $all = @()
+                            try {
+                                $marked3 = @{}
+                                Get-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
+                                    $p = $_ -split '\|', 3
+                                    if ($p.Count -ge 3 -and $p[1] -in @('SENT', 'RECEIVED', 'SNAPSHOT')) { $marked3[$p[2].ToLowerInvariant()] = $true }
+                                }
+                                $all = @(Get-ChildItem -Path $script:SyncDir -File -Recurse -ErrorAction SilentlyContinue |
+                                    Where-Object { $_.Name -notin @('change.log', '.del', '.syncpause') -and $_.Extension -notin @('.part', '.synczip') -and $_.Name -notmatch '^(status|progress)-' } |
+                                    ForEach-Object { $rel = Get-RelPath -FullName $_.FullName; if (-not $marked3[$rel.ToLowerInvariant()]) { $_.FullName } })
+                            } catch {}
+                            if ($all.Count -gt 0) { Start-SendNow -FileList $all }
+                            else { Write-Log "CMD: очередь пуста" "White" }
                         } elseif ($panel -eq 'loc' -and $op -eq 'copy') {
-                            # Локально: снять отметки change.log - уедет при следующем окне простоя.
-                            # Слушатель сам перечитает change.log по mtime - без перезапуска.
-                            $rm = Remove-ChangeEntries -RelPaths $paths
-                            Write-Log "CMD: к отправке помечено $($paths.Count) эл. (записей снято: $rm)" "White"
+                            # Прямая отправка отмеченного мимо disk: приёмник разложит
+                            # по [Routes] (папка назначения по шаблону) или в InDir
+                            $abs = @($paths | ForEach-Object { Resolve-SyncPath -Rel $_ } | Where-Object { $_ })
+                            if (Start-SendNow -FileList $abs) { Write-Log "CMD: отправляется $($abs.Count) эл. (прямая отправка)" "White" }
                         } elseif ($panel -eq 'loc' -and $op -eq 'del') {
                             foreach ($rel in $paths) { Backup-SyncItem -Rel $rel }
                             [void](Remove-ChangeEntries -RelPaths $paths)
@@ -2763,7 +2864,7 @@ function Invoke-WebStatus {
 $Action = $null
 $Paths  = @()
 foreach ($arg in $Targets) {
-    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend", "ClearDisk", "MarkDelete", "History", "Web")) {
+    if ($arg -in @("Pack", "PackAuto", "Unpack", "UnpackTo", "Watch", "SetLocal", "DelLocal", "LocalShow", "Resend", "ClearDisk", "MarkDelete", "History", "Web", "SendNow")) {
         $Action = $arg
     } else {
         $Paths += $arg
@@ -2814,6 +2915,9 @@ elseif ($Action -eq "DelLocal") {
 }
 elseif ($Action -eq "Resend") {
     Invoke-Resend -Masks $Paths
+}
+elseif ($Action -eq "SendNow") {
+    Invoke-SendNow -ListFile $Paths[0]
 }
 elseif ($Action -eq "ClearDisk") {
     Invoke-ClearDisk

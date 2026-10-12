@@ -59,6 +59,7 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <div id="drop">&#128230; перетащите файлы/папки
 <input type="file" id="pickfiles" multiple style="display:none">
 <input type="file" id="pickdir" webkitdirectory multiple style="display:none">
+<label class="sub" style="cursor:pointer"><input type="checkbox" id="senddirect"> отправить сразу (мимо disk, по маршрутам)</label>
 <button class="btn tool" onclick="event.stopPropagation();document.getElementById('pickfiles').click()">Выбрать файлы</button>
 <button class="btn tool" onclick="event.stopPropagation();document.getElementById('pickdir').click()">Папка</button>
 <span class="sub">крупное — лучше архивом</span></div>
@@ -75,7 +76,7 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <div class="panel">
 <div class="phead"><b>Другой ПК</b> <span id="reminfo" class="sub"></span>
 <button class='btn tool' onclick="location.href='/refresh-remote'" title="Обновить список">&#8635;</button>
-<button class='btn tool' onclick="cmd('copy','rem')" title="Запросить отмеченное с другого ПК">Копировать</button>
+<button class='btn tool' onclick="cmd('copy','rem')" title="Отправить отмеченное на этот ПК">Отправить</button>
 <button class='btn stop' onclick="cmd('del','rem')" title="Удалить отмеченное у другого ПК">Удалить</button>
 <label class="sub"><input type="checkbox" id="selall_rem" onchange="selAll(this,'rem')"> все</label></div>
 <div class="pbody" id="rembody"></div>
@@ -290,19 +291,20 @@ function walkEntry(entry, base, out, done){
 }
 function uploadList(list){
   if (!list.length) return;
+  var immediate = document.getElementById('senddirect').checked;
   uploading = true;
   var dz = document.getElementById('drop');
   var pending = list.length;
-  dz.innerHTML = 'Передача в SyncDir... ' + pending + ' файл(ов)';
+  dz.innerHTML = immediate ? 'Прямая отправка... ' + pending + ' файл(ов)' : 'Передача в SyncDir... ' + pending + ' файл(ов)';
   list.forEach(function(item){
     var r = new FileReader();
     r.onload = function(){
       var xhr = new XMLHttpRequest();
-      xhr.open('POST', '/drop', true);
+      xhr.open('POST', immediate ? '/sendnow' : '/drop', true);
       xhr.setRequestHeader('Content-Type','application/json');
       xhr.onload = xhr.onerror = function(){
         pending--;
-        if (pending > 0) dz.innerHTML = 'Передача в SyncDir... осталось ' + pending;
+        if (pending > 0) dz.innerHTML = 'Осталось ' + pending;
         else { uploading = false; location.reload(); }
       };
       xhr.send(JSON.stringify({name: item.file.name, path: item.path, data: r.result.split(',')[1]}));
