@@ -2626,8 +2626,12 @@ function Invoke-WebStatus {
                     $paths = @($kv['paths'] -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
                         ForEach-Object { ($_ -replace '\\', '/').Trim('/') } | Where-Object { $_ -and $_ -notmatch '\.\.' })
                     $paths = @($paths | Select-Object -Unique)
-                    if ($paths.Count -gt 0 -and $panel -in @('loc', 'rem') -and $op -in @('copy', 'del')) {
-                        if ($panel -eq 'loc' -and $op -eq 'copy') {
+                    if (($paths.Count -gt 0 -or ($panel -eq 'loc' -and $op -eq 'sendall')) -and $panel -in @('loc', 'rem') -and $op -in @('copy', 'del', 'sendall')) {
+                        if ($panel -eq 'loc' -and $op -eq 'sendall') {
+                            # Отправить всё: change.log обнуляется - весь disk уедет заново
+                            Set-Content -LiteralPath (Join-Path $script:SyncDir "change.log") -Value "" -Encoding UTF8
+                            Write-Log "CMD: вся очередь помечена к отправке заново" "White"
+                        } elseif ($panel -eq 'loc' -and $op -eq 'copy') {
                             # Локально: снять отметки change.log - уедет при следующем окне простоя.
                             # Слушатель сам перечитает change.log по mtime - без перезапуска.
                             $rm = Remove-ChangeEntries -RelPaths $paths

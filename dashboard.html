@@ -17,7 +17,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#171a21;color:#dfe3ea;di
 #drop.over{border-color:#7cc7ff;color:#7cc7ff}
 #drop button{margin:0}
 /* Командер: две панели */
-.cmd{flex:1 1 52%;display:flex;gap:8px;min-height:0;margin-bottom:8px}
+.cmd{flex:1 1 55%;display:flex;gap:8px;min-height:220px;margin-bottom:8px}
 .panel{flex:1;display:flex;flex-direction:column;background:#232833;border-radius:8px;min-width:0}
 .phead{display:flex;align-items:center;gap:6px;padding:7px 10px;border-bottom:1px solid #262b35}
 .phead b{font-size:13px}
@@ -40,9 +40,11 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#171a21;color:#dfe3ea;di
 .ptitle{white-space:nowrap;color:#9aa3b2}
 .pbar{flex:1;height:6px;background:#171a21;border-radius:3px;overflow:hidden}
 .pfill{height:100%;background:#4a90d9;border-radius:3px}
-/* Лог + параметры */
-.cols{flex:1 1 38%;display:flex;gap:8px;min-height:0;margin-bottom:12px}
-.logwrap{flex:1 1 62%;overflow-y:auto;background:#232833;border-radius:8px;padding:4px 12px 10px}
+/* Лог + очередь + параметры */
+.cols{flex:1 1 30%;display:flex;gap:8px;min-height:140px;margin-bottom:12px}
+.leftcol{flex:1 1 62%;display:flex;flex-direction:column;min-width:0;gap:8px}
+.logwrap{flex:1 1 auto;overflow-y:auto;background:#232833;border-radius:8px;padding:4px 12px 10px}
+.queuewrap{flex:0 0 30%;display:flex;flex-direction:column;overflow:hidden;margin-bottom:0;padding:6px 10px}
 #settings{flex:0 0 300px;overflow-y:auto;margin-bottom:0}
 #settings label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0}
 #settings .pname{color:#9aa3b2;font-size:12px}
@@ -61,13 +63,9 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <button class="btn tool" onclick="event.stopPropagation();document.getElementById('pickdir').click()">Папка</button>
 <span class="sub">крупное — лучше архивом</span></div>
 <div class="cmd">
-<div class="panel" style="flex:0 0 200px">
-<div class="phead"><b>&#9733; Избранное</b></div>
-<div class="pbody" id="favbody"></div>
-</div>
 <div class="panel">
 <div class="phead"><b>disk (этот ПК)</b>
-<button class='btn tool' onclick="cmd('copy','loc')" title="Отправить отмеченное на другой ПК">Копировать</button>
+<button class='btn tool' onclick="cmd('copy','loc')" title="Отправить отмеченное на другой ПК">Отправить</button>
 <button class='btn stop' onclick="cmd('del','loc')" title="Удалить отмеченное локально (бэкап в TEMP)">Удалить</button>
 <label class="sub"><input type="checkbox" id="selall_loc" onchange="selAll(this,'loc')"> все</label>
 <span class="sub" id="locinfo"></span></div>
@@ -90,7 +88,7 @@ tr.svc td:nth-child(2){color:#9aa3b2}tr.warn td:nth-child(2){color:#e8c268}tr.ba
 <tbody id="logbody">{ROWS}</tbody>
 </table></div>
 <div class="card" style="flex:0 0 30%;display:flex;flex-direction:column;overflow:hidden;margin-bottom:0;padding:6px 10px">
-<div class='sub' style='padding:2px 0'>Очередь disk (не отправлено)</div>
+<div class='sub' style='padding:2px 0'>Очередь disk (не отправлено) <button class='btn tool' style='padding:1px 8px;font-size:11px' onclick="sendAll()">Отправить всё</button></div>
 <div id="queuepanel" style="overflow-y:auto">{QUEUE}</div>
 </div>
 </div>
@@ -111,6 +109,11 @@ setInterval(function(){ if (uploading) return;
     if ((el = document.getElementById('logbody'))) el.innerHTML = s.rows;
   }).catch(function(){});
 }, 3000);
+function sendAll(){
+  if (!confirm('Отправить ВСЮ очередь на другой ПК?')) return;
+  fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'panel=loc&op=sendall&paths='})
+    .then(function(){ location.reload(); });
+}
 function post(p){ fetch(p,{method:'POST'}).then(function(){ location.reload(); }); }
 function note(msg){ var el=document.getElementById('note'); el.textContent=msg; setTimeout(function(){ el.textContent=''; }, 6000); }
 function copyLog(){
@@ -152,6 +155,23 @@ function renderPanel(side, data){
     h += " <a onclick=\"nav('"+side+"','"+acc+"')\">"+parts[i]+"/</a>"; }
   cr.innerHTML = h;
   body.appendChild(cr);
+  // избранное этой панели: ★ папка · клик — переход, ✕ — убрать
+  var favs = getFav().filter(function(x){ return x.side === side; });
+  if (favs.length) {
+    var fh = document.createElement('div'); fh.className='crumb'; fh.style.paddingBottom='4px';
+    fh.innerHTML = "<span class='sub'>&#9733; </span>";
+    getFav().forEach(function(x){
+      if (x.side !== side) return;
+      var a = document.createElement('a'); a.style.cursor='pointer'; a.title=x.rel;
+      a.textContent = x.rel.split('/').pop() || x.rel;
+      a.onclick = function(){ nav(side, x.rel); };
+      fh.appendChild(a);
+      var del = document.createElement('a'); del.textContent='\u2715'; del.style.cursor='pointer'; del.title='Убрать';
+      del.onclick = function(e){ e.stopPropagation(); delFav(getFav().indexOf(x)); renderAll(); };
+      fh.appendChild(del); fh.appendChild(document.createTextNode('  '));
+    });
+    body.appendChild(fh);
+  }
   // entries текущей папки
   var dirs = {}, files = [];
   for (var i=0;i<data.length;i++){
@@ -196,9 +216,9 @@ function addFav(side, rel){
   var f = getFav();
   if (f.some(function(x){ return x.side === side && x.rel === rel; })) { note('Уже в избранном'); return; }
   f.push({side: side, rel: rel});
-  setFav(f); renderFav();
+  setFav(f); renderAll();
 }
-function delFav(i){ var f = getFav(); f.splice(i, 1); setFav(f); renderFav(); }
+function delFav(i){ var f = getFav(); f.splice(i, 1); setFav(f); renderAll(); }
 function renderFav(){
   var body = document.getElementById('favbody');
   var f = getFav();
@@ -231,7 +251,6 @@ function loadPanels(){
     if (mi) mi.textContent = j.machine ? (j.machine + (j.time ? ' · '+j.time : '')) : 'нет данных';
     renderPanel('rem', REM);
   }).catch(function(){ var mi=document.getElementById('reminfo'); if (mi) mi.textContent='нет данных'; renderPanel('rem', []); });
-  renderFav();
 }
 function selAll(chk, side){
   var body = document.getElementById(side+'body');
