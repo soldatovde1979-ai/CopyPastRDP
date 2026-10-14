@@ -241,11 +241,14 @@ $script:SendFailures = @{}
 # передаче (канал жив). Иначе карточка, переписываемая heartbeat'ом каждые 30 сек
 $script:ServiceSendBlocked = $false
 
-# Кэш панели «Другой ПК» командера: наполняется из status-*.json и живёт до
-# нажатия «Обновить» (/refresh-remote) — панель не дёргается при каждом рендере.
+# Кэш панели «Другой ПК» командера: наполняется из свежайшего status-*.json.
+# Перечитывается автоматически, когда mtime этого файла меняется (раз в 30 сек
+# слушатель переписывает манифест), кнопка «Обновить» (/refresh-remote) остаётся
+# принудительным сбросом — панель не дёргается при каждом рендере.
 $script:RemoteFilesCache = $null
 $script:RemoteFilesMachine = ""
 $script:RemoteFilesTime = ""
+$script:RemoteFilesStamp = $null
 
 # Разговоживание строк «НЕ ПЕРЕДАНО»: один и тот же путь логируется не чаще
 # раза в FailLogIntervalSec — иначе лежащая удалёнка заливает журнал каждый backoff.
@@ -255,9 +258,13 @@ $script:FailLogIntervalSec = 600
 # Старты приёма файлов (FileId -> время первого чанка) — для строки «ПРИНЯТО за N сек»
 $script:ReceiveStarts = @{}
 
+# Последняя записанная веха приёма (FileId -> 10/20/.../90): строка «ПРОГРЕСС»
+# в журнале пишется не чаще одного раза на каждую десятку
+$script:ReceiveDeciles = @{}
+
 # Единый фильтр «значимых» событий: и в status-файл, и в историю дашборда.
 # Один источник — фильтры не разъезжаются (правка в одном месте).
-$script:DashboardEventPattern = 'ОТПРАВКА|ОТПРАВЛЕНО|ПРИЁМ|ПРИНЯТО|НЕ ПЕРЕДАНО|FAIL|FATAL|ERROR|WARNING|CLEAR-DISK|DEL-MARKER|AUTOUPDATE|DROP|CMD:'
+$script:DashboardEventPattern = 'ОТПРАВКА|ОТПРАВЛЕНО|ПРИЁМ|ПРИНЯТО|ПРОГРЕСС|НЕ ПЕРЕДАНО|FAIL|FATAL|ERROR|WARNING|CLEAR-DISK|DEL-MARKER|AUTOUPDATE|DROP|CMD:'
 
 # Персистентный журнал диска change.log (внутри SyncDir): ключ "relpath|длина|LastWriteTimeUtc"
 # -> тип записи (SNAPSHOT/SENT/RECEIVED/LOCKED). Заменяет in-memory-память: что отправлено
@@ -360,9 +367,11 @@ function Send-FileInChunks {
 
     $savedClip = Save-ClipText
     $sendStart = Get-Date
+    $lastDecile = 0
     # Старт операции с параметрами (виден всегда; служебные status-файлы — нет):
-    # файл, объём, число чанков — чтобы по журналу было ясно, ЧТО копируется
-    if ($RelPath -notmatch '^(status|progress)-') {
+    # файл, объём, число чанков — чтобы по журналу было ясно, ЧТО копируется.
+    # Служебные маркеры (.rm/.del/.get/.mv) не логируем — их итог виден в строке CMD:
+    if ($RelPath -notmatch '^(status|progress)-' -and $RelPath -notmatch '^\.(rm|del|get|mv)$') {
         Write-Log "ОТПРАВКА: '$(if ($RelPath) { $RelPath } else { $File.Name })' ($([math]::Round($File.Length / 1MB, 2)) МБ, $totalChunks чанк(ов)) на другой ПК" "White"
         Update-ProgressState -Name $(if ($RelPath) { $RelPath } else { $File.Name }) -Chunk 0 -Total $totalChunks -Dir send -Started $sendStart
     }
@@ -463,6 +472,14 @@ function Send-FileInChunks {
             $chunkIndex++
             Write-Progress -Activity $script:ProgressActivity -Status "передано $([math]::Round(($chunkIndex-1) * $ChunkSizeMB, 0)) из $([math]::Ceiling($File.Length / 1MB)) МБ" -PercentComplete ([math]::Min(99, [int](100 * ($chunkIndex-1) / $totalChunks))) -ErrorAction SilentlyContinue
             Update-ProgressState -Name $(if ($RelPath) { $RelPath } else { $File.Name }) -Chunk ($chunkIndex - 1) -Total $totalChunks -Dir send -Started $sendStart
+            # Вехи отправки в журнал (10%, 20%, ...): видны в истории дашборда и при Debug=0
+            if ($RelPath -notmatch '^(status|progress)-' -and $RelPath -notmatch '^\.(rm|del|get|mv)$') {
+                $decile = [int]([math]::Floor((100 * ($chunkIndex - 1) / $totalChunks) / 10) * 10)
+                if ($decile -gt $lastDecile -and $decile -lt 100) {
+                    $lastDecile = $decile
+                    Write-Log "ПРОГРЕСС: '$(if ($RelPath) { $RelPath } else { $File.Name })' — ${decile}% ($([math]::Round(($chunkIndex - 1) * $ChunkSizeMB, 0)) из $([math]::Ceiling($File.Length / 1MB)) МБ)" "White"
+                }
+            }
             if ($File.Length -eq 0) { break }
         }
     } finally {
@@ -475,7 +492,7 @@ function Send-FileInChunks {
     # Итоговая строка (видна всегда): что, куда, объём, время.
     # Служебные статус-файлы дашборда не логируем — они едут каждые 30 сек.
     Clear-ProgressState
-    if ($RelPath -notmatch '^(status|progress)-') {
+    if ($RelPath -notmatch '^(status|progress)-' -and $RelPath -notmatch '^\.(rm|del|get|mv)$') {
         $durSec = [int]((Get-Date) - $sendStart).TotalSeconds
         $sizeMb = [math]::Round($File.Length / 1MB, 2)
         Write-Log "ОТПРАВЛЕНО: '$(if ($RelPath) { $RelPath } else { $File.Name })' ($sizeMb МБ, $totalChunks чанк(ов)) на другой ПК за $durSec сек" "White"
@@ -803,12 +820,23 @@ function Unpack-Files {
         }
 
         Write-Log "Received chunk $($data.ChunkIndex)/$($data.TotalChunks) for '$safeName'" "Gray"
-        # Старт приёма с параметрами (виден всегда; служебные статус-файлы — нет)
-        if ($safeName -notmatch '^(status|progress)-') {
+        # Старт приёма с параметрами (виден всегда; служебные статус-файлы и
+        # маркеры .rm/.del/.get/.mv — нет: итог маркера виден в строке CMD:).
+        # Размер «до N МБ»: чанками всегда едут верхние N МБ, реальный размер
+        # меньше — точное значение будет в строке ПРИНЯТО.
+        if ($safeName -notmatch '^(status|progress)-' -and $safeName -notmatch '^\.(rm|del|get|mv)$') {
             if ($data.ChunkIndex -eq 1) {
                 # ВНИМАНИЕ: только $() внутри строки — "$data.TotalChunks" развернёт
                 # весь объект $data вместе с Content (base64-чанк) в строку лога
-                Write-Log "ПРИЁМ: '$safeName' ($([math]::Round($data.TotalChunks * $ChunkSizeMB, 0)) МБ, $($data.TotalChunks) чанк(ов)) с другого ПК" "White"
+                Write-Log "ПРИЁМ: '$safeName' (до $([math]::Round($data.TotalChunks * $ChunkSizeMB, 0)) МБ, $($data.TotalChunks) чанк(ов)) с другого ПК" "White"
+            }
+            # Вехи приёма в журнал (10%, 20%, ...): одна строка на каждую десятку,
+            # счётчик по FileId; чанк 1 — приём начался заново
+            $rDecile = [int]([math]::Floor((100 * $data.ChunkIndex / $data.TotalChunks) / 10) * 10)
+            $rPrev = if ($data.ChunkIndex -eq 1) { 0 } elseif ($script:ReceiveDeciles.ContainsKey($data.FileId)) { $script:ReceiveDeciles[$data.FileId] } else { 0 }
+            if ($rDecile -gt $rPrev -and $rDecile -lt 100) {
+                $script:ReceiveDeciles[$data.FileId] = $rDecile
+                Write-Log "ПРОГРЕСС: '$safeName' — принято ${rDecile}% (чанк $($data.ChunkIndex) из $($data.TotalChunks))" "White"
             }
             $rStart0 = if ($script:ReceiveStarts.ContainsKey($data.FileId)) { $script:ReceiveStarts[$data.FileId] } else { Get-Date }
             Update-ProgressState -Name $safeName -Chunk $data.ChunkIndex -Total $data.TotalChunks -Dir recv -Started $rStart0
@@ -852,13 +880,15 @@ function Unpack-Files {
                 $rStart = $script:ReceiveStarts[$data.FileId]
                 $dur = if ($rStart) { [int]((Get-Date) - $rStart).TotalSeconds } else { 0 }
                 $script:ReceiveStarts.Remove($data.FileId)
-                if ($safeName -notmatch '^(status|progress)-') {
+                $script:ReceiveDeciles.Remove($data.FileId)
+                if ($safeName -notmatch '^(status|progress)-' -and $safeName -notmatch '^\.(rm|del|get|mv)$') {
                     $sizeMbR = [math]::Round((Get-Item -LiteralPath $finalPath).Length / 1MB, 2)
                     Write-Log "ПРИНЯТО: '$safeName' ($sizeMbR МБ, $($data.TotalChunks) чанк(ов)) с другого ПК за $dur сек" "White"
                 }
                 Clear-ProgressState
 
                 # Самообновление: файлы FileTransfer.ps1 / setcp.ini, пришедшие в корень SyncDir,
+                # применяются в каталог запущенного скрипта, после чего слушатель перезапускается.
                 # применяются в каталог запущенного скрипта, после чего слушатель перезапускается.
                 if ($script:AutoUpdate -and $syncRel -notmatch '/' -and $safeName -in @('FileTransfer.ps1', 'setcp.ini', 'dashboard.html')) {
                     # .ps1 перед применением проверяется синтаксически: битое
@@ -901,7 +931,8 @@ function Unpack-Files {
                 $rStart = $script:ReceiveStarts[$data.FileId]
                 $dur = if ($rStart) { [int]((Get-Date) - $rStart).TotalSeconds } else { 0 }
                 $script:ReceiveStarts.Remove($data.FileId)
-                if ($safeName -notmatch '^(status|progress)-') {
+                $script:ReceiveDeciles.Remove($data.FileId)
+                if ($safeName -notmatch '^(status|progress)-' -and $safeName -notmatch '^\.(rm|del|get|mv)$') {
                     $sizeMbR = [math]::Round((Get-Item -LiteralPath $finalPath).Length / 1MB, 2)
                     Write-Log "ПРИНЯТО: '$safeName' ($sizeMbR МБ, $($data.TotalChunks) чанк(ов)) с другого ПК за $dur сек" "White"
                 }
@@ -1070,7 +1101,10 @@ function Wait-SyncAck {
                 if ($clipOurs) { [System.Windows.Forms.Clipboard]::Clear() }
             } catch {}
             # Лог и звук — не чаще раза в FailLogIntervalSec на путь: лежащая
-            # удалёнка не должна заливать журнал и дёргать звуком каждый backoff
+            # удалёнка не должна заливать журнал и дёргать звуком каждый backoff.
+            # Служебные файлы (status/progress) не логируем: их молчание и так
+            # видно в строке «Другой ПК: молчит N мин»
+            if ($RelPath -match '^(status|progress)-') { return $false }
             $lastLog = $script:LastFailLog[$RelPath]
             if (-not $lastLog -or ((Get-Date) - $lastLog).TotalSeconds -gt $script:FailLogIntervalSec) {
                 Write-Log "НЕ ПЕРЕДАНО: '$RelPath' — приёмник не отвечает (ждали $ackTimeout сек), повтор по расписанию backoff" "Yellow"
@@ -1769,7 +1803,7 @@ function Watch-Clipboard {
                         if ($_.PSIsContainer) { "$mRel|0|d" }
                         elseif ($_.Name -in @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -or $_.Extension -in @('.part', '.synczip')) { return }
                         elseif ($_.Name -match '^(status|progress)-') { return }
-                        else { "$mRel|$($_.Length)|f" }
+                        else { "$mRel|$($_.Length)|f|$($_.LastWriteTime.ToString('dd.MM.yy HH:mm'))" }
                     })
                 $st = @{ Machine = $env:COMPUTERNAME; Time = (Get-Date -Format "yyyy-MM-dd HH:mm:ss"); Events = $ev; Files = $manifest }
                 $stPath = Join-Path $script:SyncDir ("status-{0}.json" -f $env:COMPUTERNAME)
@@ -2059,8 +2093,10 @@ function Apply-SyncMarker {
 }
 
 function Get-SyncFileList {
-    # Плоский список содержимого SyncDir для командера: "rel|размер|f|d",
+    # Плоский список содержимого SyncDir для командера: "rel|размер|f|дата",
     # служебные файлы исключены. Лимит 3000 записей (защита от гигантских JSON).
+    # Дата изменения (dd.MM.yy HH:mm) — 4-е поле; панели дашборда показывают её
+    # у файлов, старые клиенты поле игнорируют.
     $list = New-Object System.Collections.Generic.List[string]
     foreach ($item in @(Get-ChildItem -Path $script:SyncDir -Recurse -Force -ErrorAction SilentlyContinue)) {
         if ($list.Count -ge 3000) { break }
@@ -2069,7 +2105,7 @@ function Get-SyncFileList {
         if ($item.PSIsContainer) { $list.Add("$rel|0|d"); continue }
         if ($item.Name -in @('change.log', '.del', '.rm', '.get', '.mv', '.syncpause') -or $item.Extension -in @('.part', '.synczip')) { continue }
         if ($item.Name -match '^(status|progress)-') { continue }
-        $list.Add("$rel|$($item.Length)|f")
+        $list.Add("$rel|$($item.Length)|f|$($item.LastWriteTime.ToString('dd.MM.yy HH:mm'))")
     }
     return $list
 }
@@ -2550,14 +2586,21 @@ function Get-DashboardState {
         if ($line -match '^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[[^\]]+\] (.*)$') { $t = $matches[1]; $m = $matches[2] } else { $t = ''; $m = $line }
         $events.Add([pscustomobject]@{ T = $t; M = $m })
     }
-    $remoteFiles = @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "status-*.json" -ErrorAction SilentlyContinue)
+    # Статус «Другой ПК» — только от свежайшего манифеста: протухший чужой файл
+    # (старое имя машины, ручная копия) не должен перебивать свежий статус
+    $remoteFiles = @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "status-*.json" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    $remoteSet = $false
     foreach ($rf in $remoteFiles) {
         try {
             # Свой статус-файл пропускаем — его события и так в локальной истории
             if ($rf.Name -ieq "status-$env:COMPUTERNAME.json") { continue }
             $j = $rf | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
-            $state.RemoteName = $j.Machine
-            $state.RemoteAge = [int]((Get-Date) - [datetime]::ParseExact($j.Time, "yyyy-MM-dd HH:mm:ss", $null)).TotalSeconds
+            if (-not $remoteSet) {
+                $state.RemoteName = $j.Machine
+                $state.RemoteAge = [int]((Get-Date) - [datetime]::ParseExact($j.Time, "yyyy-MM-dd HH:mm:ss", $null)).TotalSeconds
+                $remoteSet = $true
+            }
             foreach ($ev in @($j.Events)) {
                 $m0 = [string]$ev.M; if ($m0.Length -gt 300) { $m0 = $m0.Substring(0, 300) + '...' }
                 $events.Add([pscustomobject]@{ T = $ev.T; M = "[$($j.Machine)] $m0" })
@@ -2632,25 +2675,29 @@ function Invoke-WebStatus {
                         $entries = New-Object System.Collections.Generic.List[string]
                         foreach ($it in @(Get-ChildItem -LiteralPath $sub -Force -ErrorAction SilentlyContinue | Select-Object -First 3000)) {
                             $rel = ($it.FullName -replace '\\', '/')
-                            if ($it.PSIsContainer) { $entries.Add("$rel|0|d") } else { $entries.Add("$rel|$($it.Length)|f") }
+                            if ($it.PSIsContainer) { $entries.Add("$rel|0|d") }
+                            else { $entries.Add("$rel|$($it.Length)|f|$($it.LastWriteTime.ToString('dd.MM.yy HH:mm'))") }
                         }
                         $j = @{ ok = $true; files = $entries; root = $sub }
                     } else {
                         $j = @{ ok = $true; files = @(Get-SyncFileList); root = $script:SyncDir }
                     }
                 } else {
-                    if (-not $script:RemoteFilesCache) {
-                        try {
-                            $rf = @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "status-*.json" -ErrorAction SilentlyContinue |
-                                Where-Object { $_.Name -ine "status-$env:COMPUTERNAME.json" } | Select-Object -First 1)
-                            if ($rf) {
-                                $j0 = $rf[0] | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
-                                $script:RemoteFilesCache = @($j0.Files)
-                                $script:RemoteFilesMachine = [string]$j0.Machine
-                                $script:RemoteFilesTime = [string]$j0.Time
-                            }
-                        } catch {}
-                    }
+                    # Свежайший чужой манифест (свой пропускаем): перечитываем,
+                    # когда его mtime изменился — слушатель переписывает манифест
+                    # раз в 30 сек, панель догоняет без кнопки «Обновить»
+                    try {
+                        $rf = @(Get-ChildItem -LiteralPath $script:SyncDir -Filter "status-*.json" -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -ine "status-$env:COMPUTERNAME.json" } |
+                            Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+                        if ($rf -and $rf[0].LastWriteTimeUtc -ne $script:RemoteFilesStamp) {
+                            $j0 = $rf[0] | Get-Content -Encoding UTF8 -Raw | ConvertFrom-Json
+                            $script:RemoteFilesCache = @($j0.Files)
+                            $script:RemoteFilesMachine = [string]$j0.Machine
+                            $script:RemoteFilesTime = [string]$j0.Time
+                            $script:RemoteFilesStamp = $rf[0].LastWriteTimeUtc
+                        }
+                    } catch {}
                     $j = @{ ok = $true; files = $script:RemoteFilesCache; machine = $script:RemoteFilesMachine; time = $script:RemoteFilesTime }
                 }
                 $json = $j | ConvertTo-Json -Compress -Depth 3

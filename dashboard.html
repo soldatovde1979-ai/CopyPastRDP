@@ -17,7 +17,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#171a21;color:#dfe3ea;di
 #drop.over{border-color:#7cc7ff;color:#7cc7ff}
 #drop button{margin:0}
 /* Командер: две панели */
-.cmd{flex:1 1 55%;display:flex;gap:8px;min-height:220px;margin-bottom:8px}
+.cmd{flex:1 1 64%;display:flex;gap:8px;min-height:280px;margin-bottom:8px}
 .panel{flex:1;display:flex;flex-direction:column;background:#232833;border-radius:8px;min-width:0}
 .phead{display:flex;align-items:center;gap:6px;padding:7px 10px;border-bottom:1px solid #262b35}
 .phead b{font-size:13px}
@@ -42,7 +42,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#171a21;color:#dfe3ea;di
 .pbar{flex:1;height:6px;background:#171a21;border-radius:3px;overflow:hidden}
 .pfill{height:100%;background:#4a90d9;border-radius:3px}
 /* Лог + очередь + параметры */
-.cols{flex:1 1 30%;display:flex;gap:8px;min-height:140px;margin-bottom:12px}
+.cols{flex:1 1 24%;display:flex;gap:8px;min-height:140px;margin-bottom:12px}
 .leftcol{flex:1 1 62%;display:flex;flex-direction:column;min-width:0;gap:8px}
 .logwrap{flex:1 1 auto;overflow-y:auto;background:#232833;border-radius:8px;padding:4px 12px 10px}
 .queuewrap{flex:0 0 30%;display:flex;flex-direction:column;overflow:hidden;margin-bottom:0;padding:6px 10px}
@@ -153,12 +153,15 @@ function renderPanel(side, data){
   body.innerHTML = '';
   // «..» — подъём на уровень вверх. Локальная панель поднимается до корня
   // диска C:\ (из disk — в родительскую папку SyncDir), удалёнка — в пределах disk.
+  // «..» больше не пропадает: в правой панели он виден и на корне disk — выше
+  // удалёнки данных нет, клик остаётся на месте с подсказкой.
   var isRootDisk = !cur;
   var atDriveRoot = side === 'loc' && cur === 'C:';
-  if (!atDriveRoot && (!isRootDisk || side === 'loc')) {
+  if (!atDriveRoot) {
     var up = document.createElement('div'); up.className='row dir';
     up.innerHTML = "<span class='ic'>&#8617;</span><span class='nm'>..</span>";
     up.onclick = function(){
+      if (isRootDisk && side !== 'loc') { note('Вы в корне disk — выше данных нет'); return; }
       var target;
       if (isRootDisk) { target = parentOfRoot(); }        // из disk — выше SyncDir, к C:\
       else { var pp = cur.split('/'); pp.pop(); target = pp.join('/'); }
@@ -198,14 +201,14 @@ function renderPanel(side, data){
   // entries текущей папки
   var dirs = {}, files = [];
   for (var i=0;i<data.length;i++){
-    var p = data[i].split('|'); var rel = p[0], t = p[2];
+    var p = data[i].split('|'); var rel = p[0], t = p[2], dt = p[3] || '';
     if (cur && rel.indexOf(cur+'/') !== 0) continue;
     var rest = cur ? rel.slice(cur.length+1) : rel;
     if (!rest) continue;
     var slash = rest.indexOf('/');
     if (slash >= 0) { dirs[rest.slice(0, slash)] = 1; }
     else if (t === 'd') dirs[rest] = 2;
-    else files.push({n: rest, s: parseInt(p[1])||0, rel: rel});
+    else files.push({n: rest, s: parseInt(p[1])||0, rel: rel, d: dt});
   }
   var dk = Object.keys(dirs).sort();
   dk.forEach(function(d){
@@ -224,7 +227,7 @@ function renderPanel(side, data){
     var r = document.createElement('div'); r.className='row file';
     r.innerHTML = "<input type='checkbox'><span class='ic'>&#128196;</span><span class='nm'></span><span class='sz'></span>";
     r.querySelector('.nm').textContent = f.n;
-    r.querySelector('.sz').textContent = human(f.s);
+    r.querySelector('.sz').textContent = human(f.s) + (f.d ? ' · ' + f.d : '');
     var cb = r.querySelector('input'); cb.dataset.rel = f.rel;
     cb.addEventListener('click', function(e){ e.stopPropagation(); });
     var nm = r.querySelector('.nm');
